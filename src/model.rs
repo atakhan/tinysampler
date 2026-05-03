@@ -21,6 +21,8 @@ impl Sample {
         Self { data, spectrogram }
     }
 
+    /// Full buffer length in seconds (ignores per-clip trim).
+    #[allow(dead_code)]
     pub fn duration_secs(&self, sample_rate: u32) -> f32 {
         self.data.len() as f32 / sample_rate as f32
     }
@@ -32,6 +34,21 @@ pub struct Clip {
     /// File name only (no path), for UI on the clip.
     pub label: String,
     pub sample: Sample,
+    /// First sample index in `sample.data` (inclusive).
+    pub trim_start: usize,
+    /// One past last sample index in `sample.data` (exclusive).
+    pub trim_end: usize,
+}
+
+impl Clip {
+    pub fn visible_sample_len(&self) -> usize {
+        self.trim_end.saturating_sub(self.trim_start)
+    }
+
+    /// Timeline duration after trim.
+    pub fn timeline_duration_secs(&self, sample_rate: u32) -> f32 {
+        self.visible_sample_len() as f32 / sample_rate.max(1) as f32
+    }
 }
 
 #[derive(Clone)]

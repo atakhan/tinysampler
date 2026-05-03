@@ -105,9 +105,13 @@ pub fn spawn_output_stream(
                             continue;
                         }
                         let local = t - clip.start_time_secs;
-                        let idx = (local * rate) as usize;
-                        if idx < clip.sample.data.len() {
-                            acc += clip.sample.data[idx];
+                        let idx_in_window = (local * rate) as usize;
+                        let vis = clip.trim_end.saturating_sub(clip.trim_start);
+                        if idx_in_window < vis {
+                            let sample_idx = clip.trim_start + idx_in_window;
+                            if sample_idx < clip.sample.data.len() {
+                                acc += clip.sample.data[sample_idx];
+                            }
                         }
                     }
                     let v = acc.clamp(-1.0, 1.0);
