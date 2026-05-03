@@ -592,6 +592,15 @@ impl eframe::App for TinySamplerApp {
                         painter.rect_filled(clip_rect, 3.0, fill);
                     }
 
+                    paint_waveform_overlay(
+                        &painter,
+                        clip_rect,
+                        &clip.sample.data,
+                        clip.trim_start,
+                        clip.trim_end,
+                        ghost,
+                    );
+
                     if self.selected_clip_id == Some(clip.id) && !proj.transport.is_playing {
                         let s = (theme::TRIM_HANDLE_WIDTH_PX * 0.35).min(clip_rect.width() * 0.25);
                         let h_alpha = if ghost { 45 } else { 90 };
@@ -747,5 +756,64 @@ impl eframe::App for TinySamplerApp {
         });
 
         ctx.request_repaint_after(std::time::Duration::from_millis(33));
+    }
+}
+
+/// Min/max envelope per screen column, semi-transparent on top of spectrogram.
+/// Work is bounded: long clips would otherwise scan every sample every frame (jank after trim).
+fn paint_waveform_overlay(
+    painter: &egui::Painter,
+    clip_rect: Rect,
+    data: &[f32],
+    trim_start: usize,
+    trim_end: usize,
+    ghost: bool,
+) {
+    const MAX_COLS: usize = 1200;
+    const MAX_SAMPLES_PER_COL: usize = 256;
+
+    let vis = trim_end.saturating_sub(trim_start);
+    if vis == 0 {
+        return;
+    }
+    let pixel_w = clip_rect.width().max(1.0);
+    let cols = (pixel_w.ceil() as usize).clamp(1, MAX_COLS);
+    let center_y = clip_rect.center().y;
+    let half_h = ((clip_rect.height() - 4.0).max(4.0)) * 0.5;
+    let stroke_col = if ghost {
+        Color32::from_rgba_unmultiplied(255, 255, 255, 130)
+    } else {
+        Color32::from_rgba_unmultiplied(255, 255, 255, 95)
+    };
+    let stroke = Stroke::new(1.0, stroke_col);
+    let clip_painter = painter.with_clip_rect(clip_rect);
+    for col in 0..cols {
+        let frac = (col as f32 + 0.5) / cols as f32;
+        let x = clip_rect.left() + frac * pixel_w;
+        let i0 = trim_start + col * vis / cols;
+        let i1 = trim_start + ((col + 1) * vis / cols).max(i0 + 1).min(trim_end);
+        let span = i1 - i0;
+        let inner = span.min(MAX_SAMPLES_PER_COL).max(1);
+        let mut mn = f32::INFINITY;
+        let mut mx = f32::NEG_INFINITY;
+        for k in 0..inner {
+            let off = if inner <= 1 {
+                0usize
+            } else {
+                k * (span - 1) / (inner - 1)
+            };
+            let idx = i0 + off;
+            let Some(&s) = data.get(idx) else {
+                continue;
+            };
+            mn = mn.min(s);
+            mx = mx.max(s);
+        }
+        if !mn.is_finite() || !mx.is_finite() {
+            continue;
+        }
+        let y_top = center_y - mx * half_h;
+        let y_bot = center_y - mn * half_h;
+        clip_painter.line_segment([Pos2::new(x, y_top), Pos2::new(x, y_bot)], stroke);
     }
 }
