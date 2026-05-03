@@ -1,0 +1,19 @@
+[package]
+name = "tinysampler"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal sampler prototype: WAV, timeline, cpal callback, egui"
+
+[dependencies]
+arc-swap = "1.7"
+cpal = "0.15"
+eframe = "0.29"
+egui = "0.29"
+hound = "3.5"
+num-complex = "0.4"
+rfd = "0.15"
+rustfft = "6.2"
+
+[[bin]]
+name = "tinysampler"
+path = "src/main.rs"

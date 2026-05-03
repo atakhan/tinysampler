@@ -1,0 +1,16 @@
+# Cargo
+/target/
+**/*.rs.bk
+
+# MSVC / Windows debug symbols
+*.pdb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE / editor (optional local junk)
+.idea/
+*.swp
+*.swo
+*~
