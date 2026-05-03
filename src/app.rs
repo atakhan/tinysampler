@@ -39,6 +39,8 @@ pub struct TinySamplerApp {
     /// - Seek click: anchor so the chosen time stays under the pointer.
     /// - While playing: only edge-nudge so the playhead stays inside margins (no snap-to-center).
     timeline_scroll_px: f32,
+    /// Selected clip in the timeline (`None` if nothing selected).
+    selected_clip_index: Option<usize>,
 }
 
 impl TinySamplerApp {
@@ -76,6 +78,7 @@ impl TinySamplerApp {
             status: String::new(),
             spec_textures: Vec::new(),
             timeline_scroll_px: 0.0,
+            selected_clip_index: None,
         })
     }
 
@@ -269,7 +272,24 @@ impl TinySamplerApp {
         n * 10f32.powf(exp)
     }
 
-    fn pointer_hits_timeline_clip(
+    fn clip_rect_on_timeline(
+        clip: &Clip,
+        rect: Rect,
+        view_left: f32,
+        pps: f32,
+        scroll: f32,
+        sample_rate: u32,
+    ) -> Rect {
+        let dur = clip.sample.duration_secs(sample_rate);
+        let x0 = view_left + clip.start_time_secs * pps - scroll;
+        let w = dur * pps;
+        Rect::from_min_size(
+            Pos2::new(x0, rect.top() + 20.0),
+            Vec2::new(w.max(8.0), rect.height() - 40.0),
+        )
+    }
+
+    fn clip_index_at_pointer(
         proj: &Project,
         p: Pos2,
         rect: Rect,
@@ -277,16 +297,10 @@ impl TinySamplerApp {
         pps: f32,
         scroll: f32,
         sample_rate: u32,
-    ) -> bool {
-        proj.clips.iter().any(|clip| {
-            let dur = clip.sample.duration_secs(sample_rate);
-            let x0 = view_left + clip.start_time_secs * pps - scroll;
-            let w = dur * pps;
-            let clip_rect = Rect::from_min_size(
-                Pos2::new(x0, rect.top() + 20.0),
-                Vec2::new(w.max(8.0), rect.height() - 40.0),
-            );
-            clip_rect.contains(p)
+    ) -> Option<usize> {
+        proj.clips.iter().enumerate().find_map(|(i, clip)| {
+            let r = Self::clip_rect_on_timeline(clip, rect, view_left, pps, scroll, sample_rate);
+            r.contains(p).then_some(i)
         })
     }
 
@@ -405,6 +419,11 @@ impl eframe::App for TinySamplerApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             let proj = self.current_project();
             self.sync_spec_textures(ctx, &proj.clips);
+            if let Some(i) = self.selected_clip_index {
+                if i >= proj.clips.len() {
+                    self.selected_clip_index = None;
+                }
+            }
 
             let timeline_height = 160.0;
             let transport_block_h = BTN + TRANSPORT_RESERVE_H;
@@ -470,27 +489,31 @@ impl eframe::App for TinySamplerApp {
                 if pan_resp.clicked() {
                     if let Some(p) = pan_resp.interact_pointer_pos() {
                         let sc = self.timeline_scroll_px;
-                        let time_at = |x: f32| -> f32 { (((x - view_left) + sc) / pps).max(0.0) };
-                        if ruler_rect.contains(p) {
-                            let t = time_at(p.x);
-                            self.request_seek(t);
-                            self.timeline_scroll_px =
-                                (view_left + t * pps - p.x).clamp(0.0, max_scroll);
-                        } else if rect.contains(p)
-                            && !Self::pointer_hits_timeline_clip(
-                                &proj,
-                                p,
-                                rect,
-                                view_left,
-                                pps,
-                                sc,
-                                proj.device_sample_rate,
-                            )
-                        {
-                            let t = time_at(p.x);
-                            self.request_seek(t);
-                            self.timeline_scroll_px =
-                                (view_left + t * pps - p.x).clamp(0.0, max_scroll);
+                        if let Some(idx) = Self::clip_index_at_pointer(
+                            &proj,
+                            p,
+                            rect,
+                            view_left,
+                            pps,
+                            sc,
+                            proj.device_sample_rate,
+                        ) {
+                            self.selected_clip_index = Some(idx);
+                        } else {
+                            self.selected_clip_index = None;
+                            let time_at =
+                                |x: f32| -> f32 { (((x - view_left) + sc) / pps).max(0.0) };
+                            if ruler_rect.contains(p) {
+                                let t = time_at(p.x);
+                                self.request_seek(t);
+                                self.timeline_scroll_px =
+                                    (view_left + t * pps - p.x).clamp(0.0, max_scroll);
+                            } else if rect.contains(p) {
+                                let t = time_at(p.x);
+                                self.request_seek(t);
+                                self.timeline_scroll_px =
+                                    (view_left + t * pps - p.x).clamp(0.0, max_scroll);
+                            }
                         }
                     }
                 }
@@ -545,8 +568,6 @@ impl eframe::App for TinySamplerApp {
                         painter.rect_filled(clip_rect, 3.0, Color32::from_rgb(50, 90, 160));
                     }
 
-                    painter.rect_stroke(clip_rect, 3.0, Stroke::new(1.0, Color32::WHITE));
-
                     if !clip.label.is_empty() {
                         let inset = 6.0_f32;
                         let pad = 3.0_f32;
@@ -566,6 +587,10 @@ impl eframe::App for TinySamplerApp {
                             Color32::from_rgba_unmultiplied(0, 0, 0, 175),
                         );
                         clip_painter.galley(bg_min + Vec2::new(pad, pad), galley, Color32::WHITE);
+                    }
+
+                    if self.selected_clip_index == Some(i) {
+                        painter.rect_stroke(clip_rect, 3.0, Stroke::new(1.0, Color32::WHITE));
                     }
                 }
 
@@ -635,6 +660,14 @@ impl eframe::App for TinySamplerApp {
                         ui.label(RichText::new(&self.status).weak().size(12.0));
                     }
                 });
+
+                if ctx.input(|i| i.pointer.primary_clicked()) {
+                    if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
+                        if !combined_rect.contains(pos) {
+                            self.selected_clip_index = None;
+                        }
+                    }
+                }
             });
         });
 
