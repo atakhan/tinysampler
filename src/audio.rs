@@ -4,6 +4,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
+use crate::mix;
 use crate::model::Project;
 
 pub struct AudioEngine {
@@ -52,12 +53,16 @@ pub fn play_test_tone_blocking(duration_secs: f32) -> Result<(), String> {
     Ok(())
 }
 
-pub fn spawn_output_stream(
-    project: Arc<ArcSwap<Project>>,
+/// One default-output probe: builds [`Project`] at the device rate, starts the stream, returns handles.
+pub fn open_output<F>(
+    make_project: F,
     playhead_secs_bits: Arc<AtomicU32>,
     seek_pending: Arc<AtomicBool>,
     seek_target_secs_bits: Arc<AtomicU32>,
-) -> Result<AudioEngine, String> {
+) -> Result<(AudioEngine, Arc<ArcSwap<Project>>), String>
+where
+    F: FnOnce(u32) -> Project,
+{
     let host = cpal::default_host();
     let device = host
         .default_output_device()
@@ -66,14 +71,17 @@ pub fn spawn_output_stream(
     let sample_rate = config.sample_rate().0;
     let channels = config.channels() as usize;
 
+    let project = Arc::new(ArcSwap::from_pointee(make_project(sample_rate)));
+
     let mut playhead_secs: f32 = 0.0;
     let mut last_stop_generation: u64 = 0;
 
+    let project_for_cb = Arc::clone(&project);
     let stream = device
         .build_output_stream(
             &config.into(),
             move |data: &mut [f32], _| {
-                let proj = project.load();
+                let proj = project_for_cb.load();
                 let proj = &*proj;
                 if proj.transport.stop_generation != last_stop_generation {
                     playhead_secs = 0.0;
@@ -99,22 +107,7 @@ pub fn spawn_output_stream(
                 let base = playhead_secs;
                 for i in 0..n {
                     let t = base + i as f32 / rate;
-                    let mut acc = 0.0f32;
-                    for clip in &proj.clips {
-                        if t < clip.start_time_secs {
-                            continue;
-                        }
-                        let local = t - clip.start_time_secs;
-                        let idx_in_window = (local * rate) as usize;
-                        let vis = clip.trim_end.saturating_sub(clip.trim_start);
-                        if idx_in_window < vis {
-                            let sample_idx = clip.trim_start + idx_in_window;
-                            if sample_idx < clip.sample.data.len() {
-                                acc += clip.sample.data[sample_idx];
-                            }
-                        }
-                    }
-                    let v = acc.clamp(-1.0, 1.0);
+                    let v = mix::mix_mono_sample_at(proj, t, sample_rate);
                     let frame = i * channels;
                     for c in 0..channels {
                         data[frame + c] = v;
@@ -130,8 +123,9 @@ pub fn spawn_output_stream(
         .map_err(|e| e.to_string())?;
 
     stream.play().map_err(|e| e.to_string())?;
-    Ok(AudioEngine {
+    let engine = AudioEngine {
         stream,
         sample_rate,
-    })
+    };
+    Ok((engine, project))
 }

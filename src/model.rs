@@ -1,5 +1,9 @@
 use std::sync::Arc;
 
+/// Stable handle for a clip on the timeline (survives better than raw indices).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ClipId(pub u64);
+
 /// RGBA spectrogram for UI (time → X, frequency → Y, low freq at bottom row).
 #[derive(Clone)]
 pub struct Spectrogram {
@@ -30,6 +34,7 @@ impl Sample {
 
 #[derive(Clone)]
 pub struct Clip {
+    pub id: ClipId,
     pub start_time_secs: f32,
     /// File name only (no path), for UI on the clip.
     pub label: String,
@@ -38,6 +43,8 @@ pub struct Clip {
     pub trim_start: usize,
     /// One past last sample index in `sample.data` (exclusive).
     pub trim_end: usize,
+    /// Alt-duplicate preview: may overlap others, omitted from mix until cleared after drop.
+    pub placement_preview: bool,
 }
 
 impl Clip {
@@ -72,6 +79,8 @@ pub struct Project {
     pub clips: Vec<Clip>,
     pub transport: Transport,
     pub device_sample_rate: u32,
+    /// Monotonic source for [`ClipId`] (not serialized yet).
+    pub next_clip_id: u64,
 }
 
 impl Project {
@@ -80,6 +89,20 @@ impl Project {
             clips: Vec::new(),
             transport: Transport::default(),
             device_sample_rate,
+            next_clip_id: 1,
         }
+    }
+
+    pub fn alloc_clip_id(&mut self) -> ClipId {
+        let id = ClipId(self.next_clip_id);
+        self.next_clip_id = self.next_clip_id.wrapping_add(1);
+        if self.next_clip_id == 0 {
+            self.next_clip_id = 1;
+        }
+        id
+    }
+
+    pub fn clip_index(&self, id: ClipId) -> Option<usize> {
+        self.clips.iter().position(|c| c.id == id)
     }
 }
