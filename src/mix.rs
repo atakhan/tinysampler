@@ -2,9 +2,10 @@
 
 use crate::model::Project;
 
-/// Sum overlapping clips at timeline time `t` (seconds). `sample_rate` is the output clock.
-pub fn mix_mono_sample_at(project: &Project, t: f32, sample_rate: u32) -> f32 {
-    let rate = sample_rate as f32;
+/// Sum overlapping clips at timeline time `t` (seconds).
+/// PCM is addressed at [`Project::device_sample_rate`], independent of the current output clock.
+pub fn mix_mono_sample_at(project: &Project, t: f32) -> f32 {
+    let rate = project.device_sample_rate.max(1) as f32;
     let mut acc = 0.0f32;
     for clip in &project.clips {
         if clip.placement_preview {
