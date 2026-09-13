@@ -4,25 +4,17 @@ use std::sync::Arc;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ClipId(pub u64);
 
-/// RGBA spectrogram for UI (time → X, frequency → Y, low freq at bottom row).
-#[derive(Clone)]
-pub struct Spectrogram {
-    pub width: usize,
-    pub height: usize,
-    pub rgba: Vec<u8>,
-}
-
 /// Mono samples in f32 [-1, 1] at **device** sample rate.
 #[derive(Clone)]
 pub struct Sample {
     pub data: Arc<Vec<f32>>,
-    /// Precomputed for timeline (not read by audio thread).
-    pub spectrogram: Option<Arc<Spectrogram>>,
+    /// Min/max bins for waveform drawing (not read by the audio thread).
+    pub peaks: Arc<crate::waveform::PeakPyramid>,
 }
 
 impl Sample {
-    pub fn new_mono(data: Arc<Vec<f32>>, spectrogram: Option<Arc<Spectrogram>>) -> Self {
-        Self { data, spectrogram }
+    pub fn new_mono(data: Arc<Vec<f32>>, peaks: Arc<crate::waveform::PeakPyramid>) -> Self {
+        Self { data, peaks }
     }
 
     /// Full buffer length in seconds (ignores per-clip trim).
@@ -43,6 +35,8 @@ pub struct Clip {
     pub trim_start: usize,
     /// One past last sample index in `sample.data` (exclusive).
     pub trim_end: usize,
+    /// Lane index (0 = top). Overlap is only forbidden within the same lane.
+    pub track_index: usize,
     /// Alt-duplicate preview: may overlap others, omitted from mix until cleared after drop.
     pub placement_preview: bool,
 }
@@ -104,5 +98,25 @@ impl Project {
 
     pub fn clip_index(&self, id: ClipId) -> Option<usize> {
         self.clips.iter().position(|c| c.id == id)
+    }
+
+    /// Number of lanes to draw (at least one).
+    pub fn track_count(&self) -> usize {
+        self.clips
+            .iter()
+            .map(|c| c.track_index)
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(1)
+    }
+
+    /// Lane for the next imported file (0, then 1, then 2, …).
+    pub fn next_track_index(&self) -> usize {
+        self.clips
+            .iter()
+            .map(|c| c.track_index)
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0)
     }
 }

@@ -7,9 +7,10 @@ use crate::theme::MIN_TRIM_DURATION_SECS;
 use crate::timeline::{TrimDrag, TrimSide};
 use crate::wav_loader;
 
-pub fn append_wav_clip(project: &mut Project, sample: Sample, label: String) {
+pub fn append_audio_clip(project: &mut Project, sample: Sample, label: String) -> usize {
     let id = project.alloc_clip_id();
     let n = sample.data.len();
+    let track_index = project.next_track_index();
     project.clips.push(Clip {
         id,
         start_time_secs: 0.0,
@@ -17,36 +18,41 @@ pub fn append_wav_clip(project: &mut Project, sample: Sample, label: String) {
         sample,
         trim_start: 0,
         trim_end: n,
+        track_index,
         placement_preview: false,
     });
+    track_index
 }
 
-pub fn try_load_wav_clip(project: &mut Project, path: &Path) -> Result<(), String> {
-    let sr = project.device_sample_rate;
-    let sample = wav_loader::load_wav_mono_f32(path, sr)?;
+pub fn load_audio_file(path: &Path, sample_rate: u32) -> Result<(Sample, String), String> {
+    let sample = wav_loader::load_audio_mono_f32(path, sample_rate)?;
     let label = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("clip")
         .to_string();
-    append_wav_clip(project, sample, label);
-    Ok(())
+    Ok((sample, label))
 }
 
 /// Split the clip under `playhead_secs` into two clips. Left clip keeps the original [`ClipId`].
 pub fn split_clip_at_playhead(
     project: &mut Project,
     playhead_secs: f32,
+    preferred: Option<ClipId>,
 ) -> Result<ClipId, String> {
     let sr = project.device_sample_rate;
     let sr_f = sr as f32;
     let min_samples = ((MIN_TRIM_DURATION_SECS * sr_f).ceil() as usize).max(1);
 
-    let idx = project.clips.iter().position(|clip| {
+    let in_clip = |clip: &Clip| {
         let t0 = clip.start_time_secs;
         let t1 = t0 + clip.timeline_duration_secs(sr);
         playhead_secs > t0 && playhead_secs < t1
-    });
+    };
+    let idx = preferred
+        .and_then(|id| project.clip_index(id))
+        .filter(|&i| in_clip(&project.clips[i]))
+        .or_else(|| project.clips.iter().position(in_clip));
     let Some(i) = idx else {
         return Err("Разрез: поставьте плейхед внутри клипа.".into());
     };
@@ -73,6 +79,7 @@ pub fn split_clip_at_playhead(
         sample: clip.sample.clone(),
         trim_start: clip.trim_start,
         trim_end: split_at,
+        track_index: clip.track_index,
         placement_preview: false,
     };
     let right = Clip {
@@ -82,6 +89,7 @@ pub fn split_clip_at_playhead(
         sample: clip.sample,
         trim_start: split_at,
         trim_end: clip.trim_end,
+        track_index: clip.track_index,
         placement_preview: false,
     };
 
@@ -142,11 +150,12 @@ pub fn apply_trim_delta(project: &mut Project, drag: TrimDrag, dx_px: f32, pps: 
 
 fn merge_other_clip_intervals(project: &Project, exclude_idx: usize) -> Vec<(f32, f32)> {
     let sr = project.device_sample_rate;
+    let track = project.clips[exclude_idx].track_index;
     let mut v: Vec<(f32, f32)> = project
         .clips
         .iter()
         .enumerate()
-        .filter(|&(i, _)| i != exclude_idx)
+        .filter(|&(i, c)| i != exclude_idx && c.track_index == track)
         .map(|(_, c)| {
             let d = c.timeline_duration_secs(sr);
             (c.start_time_secs, c.start_time_secs + d)
@@ -227,7 +236,7 @@ pub fn clip_overlaps_others(project: &Project, idx: usize) -> bool {
     let t0 = c.start_time_secs;
     let t1 = t0 + c.timeline_duration_secs(sr);
     for (j, o) in project.clips.iter().enumerate() {
-        if j == idx {
+        if j == idx || o.track_index != c.track_index {
             continue;
         }
         let o0 = o.start_time_secs;
@@ -256,7 +265,7 @@ pub fn resolve_all_placement_previews(project: &mut Project) {
 /// until drop; may overlap while dragging.
 pub fn duplicate_clip(project: &mut Project, id: ClipId) -> Option<ClipId> {
     let idx = project.clip_index(id)?;
-    let (start, label, sample, trim_start, trim_end) = {
+    let (start, label, sample, trim_start, trim_end, track_index) = {
         let orig = project.clips.get(idx)?;
         (
             orig.start_time_secs,
@@ -264,6 +273,7 @@ pub fn duplicate_clip(project: &mut Project, id: ClipId) -> Option<ClipId> {
             orig.sample.clone(),
             orig.trim_start,
             orig.trim_end,
+            orig.track_index,
         )
     };
     let new_id = project.alloc_clip_id();
@@ -274,6 +284,7 @@ pub fn duplicate_clip(project: &mut Project, id: ClipId) -> Option<ClipId> {
         sample,
         trim_start,
         trim_end,
+        track_index,
         placement_preview: true,
     };
     project.clips.push(new_clip);
@@ -306,4 +317,39 @@ pub fn nudge_clip_time_by_drag(
     }
     project.clips[idx].start_time_secs = new_start;
     true
+}
+
+pub fn set_clip_track(project: &mut Project, clip_id: ClipId, track_index: usize) -> bool {
+    let Some(idx) = project.clip_index(clip_id) else {
+        return false;
+    };
+    if project.clips[idx].track_index == track_index {
+        return false;
+    }
+    project.clips[idx].track_index = track_index;
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn dummy_sample() -> Sample {
+        let data = vec![0.0f32; 64];
+        let peaks = crate::waveform::PeakPyramid::build(&data);
+        Sample::new_mono(Arc::new(data), Arc::new(peaks))
+    }
+
+    #[test]
+    fn each_imported_clip_gets_the_next_track() {
+        let mut p = Project::empty(48_000);
+        assert_eq!(append_audio_clip(&mut p, dummy_sample(), "a".into()), 0);
+        assert_eq!(append_audio_clip(&mut p, dummy_sample(), "b".into()), 1);
+        assert_eq!(append_audio_clip(&mut p, dummy_sample(), "c".into()), 2);
+        assert_eq!(p.clips[0].track_index, 0);
+        assert_eq!(p.clips[1].track_index, 1);
+        assert_eq!(p.clips[2].track_index, 2);
+        assert_eq!(p.track_count(), 3);
+    }
 }

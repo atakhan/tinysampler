@@ -24,7 +24,7 @@ pub struct TrimDrag {
 /// Major tick spacing in seconds for the time ruler (~constant label width on screen).
 pub fn time_ruler_step_secs(pps: f32) -> f32 {
     const TARGET_MAJOR_PX: f32 = 72.0;
-    let approx = (TARGET_MAJOR_PX / pps.max(1.0)).max(1e-5);
+    let approx = (TARGET_MAJOR_PX / pps.max(1e-6)).max(1e-6);
     let exp = approx.log10().floor();
     let frac = approx / 10f32.powf(exp);
     let n = if frac <= 1.0 {
@@ -41,7 +41,8 @@ pub fn time_ruler_step_secs(pps: f32) -> f32 {
 
 pub fn clip_rect_on_timeline(
     clip: &Clip,
-    rect: Rect,
+    lanes_top: f32,
+    lane_h: f32,
     view_left: f32,
     pps: f32,
     scroll: f32,
@@ -50,24 +51,35 @@ pub fn clip_rect_on_timeline(
     let dur = clip.timeline_duration_secs(sample_rate);
     let x0 = view_left + clip.start_time_secs * pps - scroll;
     let w = dur * pps;
+    let pad = 8.0_f32;
+    let lane_top = lanes_top + clip.track_index as f32 * lane_h;
     Rect::from_min_size(
-        Pos2::new(x0, rect.top() + 20.0),
-        Vec2::new(w.max(8.0), rect.height() - 40.0),
+        Pos2::new(x0, lane_top + pad),
+        Vec2::new(w.max(8.0), (lane_h - pad * 2.0).max(4.0)),
     )
+}
+
+pub fn track_index_at_y(y: f32, lanes_top: f32, lane_h: f32, max_track: usize) -> usize {
+    if lane_h <= 0.0 {
+        return 0;
+    }
+    let i = ((y - lanes_top) / lane_h).floor() as i32;
+    i.clamp(0, max_track as i32) as usize
 }
 
 pub fn trim_hit_test(
     proj: &Project,
     selected_id: ClipId,
     pos: Pos2,
-    rect: Rect,
+    lanes_top: f32,
+    lane_h: f32,
     view_left: f32,
     pps: f32,
     scroll: f32,
     sample_rate: u32,
 ) -> Option<TrimDrag> {
     let clip = proj.clips.iter().find(|c| c.id == selected_id)?;
-    let cr = clip_rect_on_timeline(clip, rect, view_left, pps, scroll, sample_rate);
+    let cr = clip_rect_on_timeline(clip, lanes_top, lane_h, view_left, pps, scroll, sample_rate);
     let hw = TRIM_HANDLE_WIDTH_PX.min(cr.width() * 0.5);
     let left_h = Rect::from_min_size(cr.min, Vec2::new(hw, cr.height()));
     let right_h = Rect::from_min_max(Pos2::new(cr.right() - hw, cr.top()), cr.max);
@@ -90,7 +102,8 @@ pub fn pointer_near_trim_handle(
     proj: &Project,
     selected: Option<ClipId>,
     pos: Pos2,
-    rect: Rect,
+    lanes_top: f32,
+    lane_h: f32,
     view_left: f32,
     pps: f32,
     scroll: f32,
@@ -99,7 +112,18 @@ pub fn pointer_near_trim_handle(
     let Some(sid) = selected else {
         return false;
     };
-    trim_hit_test(proj, sid, pos, rect, view_left, pps, scroll, sample_rate).is_some()
+    trim_hit_test(
+        proj,
+        sid,
+        pos,
+        lanes_top,
+        lane_h,
+        view_left,
+        pps,
+        scroll,
+        sample_rate,
+    )
+    .is_some()
 }
 
 /// Selected clip body (full rect minus trim handles) — for move hover / drag start.
@@ -107,7 +131,8 @@ pub fn pointer_on_selected_clip_move_body(
     proj: &Project,
     selected: Option<ClipId>,
     pos: Pos2,
-    rect: Rect,
+    lanes_top: f32,
+    lane_h: f32,
     view_left: f32,
     pps: f32,
     scroll: f32,
@@ -116,20 +141,33 @@ pub fn pointer_on_selected_clip_move_body(
     let Some(sid) = selected else {
         return false;
     };
-    if trim_hit_test(proj, sid, pos, rect, view_left, pps, scroll, sample_rate).is_some() {
+    if trim_hit_test(
+        proj,
+        sid,
+        pos,
+        lanes_top,
+        lane_h,
+        view_left,
+        pps,
+        scroll,
+        sample_rate,
+    )
+    .is_some()
+    {
         return false;
     }
     let Some(clip) = proj.clips.iter().find(|c| c.id == sid) else {
         return false;
     };
-    let cr = clip_rect_on_timeline(clip, rect, view_left, pps, scroll, sample_rate);
+    let cr = clip_rect_on_timeline(clip, lanes_top, lane_h, view_left, pps, scroll, sample_rate);
     cr.contains(pos)
 }
 
 pub fn clip_index_at_pointer(
     proj: &Project,
     p: Pos2,
-    rect: Rect,
+    lanes_top: f32,
+    lane_h: f32,
     view_left: f32,
     pps: f32,
     scroll: f32,
@@ -140,7 +178,7 @@ pub fn clip_index_at_pointer(
     order.sort_by_key(|&i| !proj.clips[i].placement_preview);
     order.into_iter().find_map(|i| {
         let clip = &proj.clips[i];
-        let r = clip_rect_on_timeline(clip, rect, view_left, pps, scroll, sample_rate);
+        let r = clip_rect_on_timeline(clip, lanes_top, lane_h, view_left, pps, scroll, sample_rate);
         r.contains(p).then_some(i)
     })
 }
@@ -148,13 +186,14 @@ pub fn clip_index_at_pointer(
 pub fn clip_id_at_pointer(
     proj: &Project,
     p: Pos2,
-    rect: Rect,
+    lanes_top: f32,
+    lane_h: f32,
     view_left: f32,
     pps: f32,
     scroll: f32,
     sample_rate: u32,
 ) -> Option<ClipId> {
-    let i = clip_index_at_pointer(proj, p, rect, view_left, pps, scroll, sample_rate)?;
+    let i = clip_index_at_pointer(proj, p, lanes_top, lane_h, view_left, pps, scroll, sample_rate)?;
     Some(proj.clips[i].id)
 }
 
@@ -167,8 +206,12 @@ fn format_ruler_time(secs: f32, step: f32) -> String {
         format!("{:.0}", secs)
     } else if step >= 0.1 {
         format!("{:.1}", secs)
-    } else {
+    } else if step >= 0.01 {
         format!("{:.2}", secs)
+    } else if step >= 0.001 {
+        format!("{:.3}", secs)
+    } else {
+        format!("{:.0} ms", secs * 1000.0)
     }
 }
 
@@ -206,26 +249,34 @@ pub fn paint_time_ruler(painter: &Painter, ruler_rect: Rect, pps: f32, scroll: f
     );
 
     let step = time_ruler_step_secs(pps);
+    if !pps.is_finite() || pps <= 0.0 || !step.is_finite() || step <= 0.0 {
+        return;
+    }
     let span_secs = ruler_rect.width() / pps;
     let t_max = scroll / pps + span_secs + step * 2.0;
+    const MAX_TICKS: u32 = 256;
 
     if let Some(minor_step) = time_ruler_minor_step(step, pps) {
-        let t_minor0 = (scroll / pps / minor_step).floor() * minor_step;
-        let mut tm = t_minor0;
-        while tm <= t_max {
-            if !is_time_ruler_major_tick(tm, step) {
-                let x = ruler_rect.left() + tm * pps - scroll;
-                if x >= ruler_rect.left() - 1.0 && x <= ruler_rect.right() + 1.0 {
-                    painter.line_segment(
-                        [
-                            Pos2::new(x, ruler_rect.bottom() - 5.0),
-                            Pos2::new(x, ruler_rect.bottom()),
-                        ],
-                        Stroke::new(1.0, line_minor),
-                    );
+        if minor_step.is_finite() && minor_step > 0.0 {
+            let t_minor0 = (scroll / pps / minor_step).floor() * minor_step;
+            let mut tm = t_minor0;
+            let mut n = 0u32;
+            while tm <= t_max && n < MAX_TICKS {
+                if !is_time_ruler_major_tick(tm, step) {
+                    let x = ruler_rect.left() + tm * pps - scroll;
+                    if x >= ruler_rect.left() - 1.0 && x <= ruler_rect.right() + 1.0 {
+                        painter.line_segment(
+                            [
+                                Pos2::new(x, ruler_rect.bottom() - 5.0),
+                                Pos2::new(x, ruler_rect.bottom()),
+                            ],
+                            Stroke::new(1.0, line_minor),
+                        );
+                    }
                 }
+                tm += minor_step;
+                n += 1;
             }
-            tm += minor_step;
         }
     }
 
@@ -233,7 +284,8 @@ pub fn paint_time_ruler(painter: &Painter, ruler_rect: Rect, pps: f32, scroll: f
     let font = FontId::proportional(11.0);
 
     let mut t = t_min;
-    while t <= t_max {
+    let mut n = 0u32;
+    while t <= t_max && n < MAX_TICKS {
         let x = ruler_rect.left() + t * pps - scroll;
         if x >= ruler_rect.left() - 1.0 && x <= ruler_rect.right() + 1.0 {
             painter.line_segment(
@@ -250,6 +302,7 @@ pub fn paint_time_ruler(painter: &Painter, ruler_rect: Rect, pps: f32, scroll: f
             painter.galley(Pos2::new(tx, ruler_rect.top() + 3.0), galley, text_col);
         }
         t += step;
+        n += 1;
     }
 }
 
@@ -282,9 +335,7 @@ pub fn scroll_keep_playhead_in_view(
     max_scroll: f32,
     scroll: f32,
 ) -> f32 {
-    let m = theme::PLAYHEAD_EDGE_MARGIN_PX
-        .min(rect.width() * 0.15)
-        .max(20.0);
+    let m = playhead_follow_margin(rect);
     let ph_px = playhead_secs * pps;
     let play_x = rect.left() + ph_px - scroll;
     let mut s = scroll;
@@ -296,4 +347,16 @@ pub fn scroll_keep_playhead_in_view(
         s -= left_bound - play_x;
     }
     s.clamp(0.0, max_scroll)
+}
+
+fn playhead_follow_margin(rect: Rect) -> f32 {
+    theme::PLAYHEAD_EDGE_MARGIN_PX
+        .min(rect.width() * 0.15)
+        .max(20.0)
+}
+
+pub fn playhead_in_viewport(rect: Rect, playhead_secs: f32, pps: f32, scroll: f32) -> bool {
+    let m = playhead_follow_margin(rect);
+    let play_x = rect.left() + playhead_secs * pps - scroll;
+    play_x >= rect.left() + m && play_x <= rect.right() - m
 }

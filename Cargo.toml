@@ -2,7 +2,7 @@
 name = "tinysampler"
 version = "0.1.0"
 edition = "2021"
-description = "Minimal sampler prototype: WAV, timeline, cpal callback, egui"
+description = "Minimal sampler prototype: WAV/MP3, timeline, cpal callback, egui"
 
 [dependencies]
 arc-swap = "1.7"
@@ -10,10 +10,25 @@ cpal = "0.15"
 eframe = "0.29"
 egui = "0.29"
 hound = "3.5"
-num-complex = "0.4"
 rfd = "0.15"
-rustfft = "6.2"
+symphonia = { version = "0.5", default-features = false, features = ["mp3"] }
 
 [[bin]]
 name = "tinysampler"
 path = "src/main.rs"
+
+# MP3 decode is unusably slow at opt-level 0 (`cargo run`).
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package.symphonia]
+opt-level = 3
+
+[profile.dev.package.symphonia-bundle-mp3]
+opt-level = 3
+
+[profile.dev.package.symphonia-core]
+opt-level = 3
+
+[profile.dev.package.symphonia-metadata]
+opt-level = 3

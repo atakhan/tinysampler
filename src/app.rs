@@ -1,14 +1,17 @@
+use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use egui::{Color32, CursorIcon, Key, Pos2, Rect, Stroke, Vec2};
 
-use crate::model::{ClipId, Project};
+use crate::model::{ClipId, Project, Sample};
 use crate::project_actions;
-use crate::spec_textures::SpecTextureCache;
 use crate::theme;
 use crate::timeline::{self, TrimDrag};
+use crate::waveform::PeakPyramid;
 
 use crate::audio;
 
@@ -29,7 +32,6 @@ pub struct TinySamplerApp {
     engine: audio::AudioEngine,
     pixels_per_second: f32,
     status: String,
-    spec_cache: SpecTextureCache,
     timeline_scroll_px: f32,
     selected_clip_id: Option<ClipId>,
     trim_drag: Option<TrimDrag>,
@@ -37,6 +39,10 @@ pub struct TinySamplerApp {
     /// `true` only for Alt+duplicate drag; `false` for normal move (both use ghost preview).
     clip_move_from_alt_duplicate: bool,
     clip_settle_anim: Option<ClipSettleAnim>,
+    load_rx: Option<Receiver<Result<(Sample, String), String>>>,
+    /// Play: user panned away; edge-follow waits until the playhead is on screen again.
+    follow_playhead_suspended: bool,
+    pending_loads: VecDeque<PathBuf>,
 }
 
 impl TinySamplerApp {
@@ -64,13 +70,15 @@ impl TinySamplerApp {
             engine,
             pixels_per_second: 120.0,
             status: String::new(),
-            spec_cache: SpecTextureCache::default(),
             timeline_scroll_px: 0.0,
             selected_clip_id: None,
             trim_drag: None,
             clip_move_drag: None,
             clip_move_from_alt_duplicate: false,
             clip_settle_anim: None,
+            load_rx: None,
+            follow_playhead_suspended: false,
+            pending_loads: VecDeque::new(),
         })
     }
 
@@ -190,29 +198,124 @@ impl TinySamplerApp {
         self.clip_move_from_alt_duplicate = false;
         self.clip_settle_anim = None;
         self.seek_pending.store(false, Ordering::Release);
+        self.follow_playhead_suspended = false;
     }
 
-    fn try_pick_and_load_wav(&mut self) {
+    fn try_pick_and_load_audio(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Audio", &["wav", "mp3"])
             .add_filter("WAV", &["wav"])
+            .add_filter("MP3", &["mp3"])
             .pick_file()
         {
-            let mut p = (*self.current_project()).clone();
-            match project_actions::try_load_wav_clip(&mut p, &path) {
-                Ok(()) => {
-                    self.status.clear();
-                    self.publish(p);
-                }
-                Err(e) => self.status = e,
-            }
+            self.enqueue_audio_path(path);
         }
+    }
+
+    fn is_supported_audio_path(path: &std::path::Path) -> bool {
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| {
+                let e = e.to_ascii_lowercase();
+                e == "wav" || e == "mp3"
+            })
+            .unwrap_or(false)
+    }
+
+    fn enqueue_audio_path(&mut self, path: PathBuf) {
+        if !Self::is_supported_audio_path(&path) {
+            self.status = format!(
+                "unsupported audio format (use WAV or MP3): {}",
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("file")
+            );
+            return;
+        }
+        self.pending_loads.push_back(path);
+        self.start_next_load_if_idle();
+    }
+
+    fn start_next_load_if_idle(&mut self) {
+        if self.load_rx.is_some() {
+            return;
+        }
+        let Some(path) = self.pending_loads.pop_front() else {
+            return;
+        };
+        let sample_rate = self.current_project().device_sample_rate;
+        let (tx, rx) = mpsc::channel();
+        self.load_rx = Some(rx);
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file");
+        self.status = format!("Загрузка {name}…");
+        std::thread::spawn(move || {
+            let _ = tx.send(project_actions::load_audio_file(&path, sample_rate));
+        });
+    }
+
+    fn poll_dropped_files(&mut self, ctx: &egui::Context) {
+        let hovered = ctx.input(|i| !i.raw.hovered_files.is_empty());
+        const DROP_HINT: &str = "Отпустите WAV или MP3, чтобы загрузить";
+        if hovered {
+            if self.status.is_empty() || self.status == DROP_HINT {
+                self.status = DROP_HINT.into();
+            }
+        } else if self.status == DROP_HINT {
+            self.status.clear();
+        }
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        for path in dropped {
+            self.enqueue_audio_path(path);
+        }
+    }
+
+    fn poll_audio_load(&mut self, ctx: &egui::Context) {
+        let outcome = {
+            let Some(rx) = &self.load_rx else {
+                self.start_next_load_if_idle();
+                return;
+            };
+            match rx.try_recv() {
+                Ok(v) => Some(v),
+                Err(mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint();
+                    return;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => None,
+            }
+        };
+        self.load_rx = None;
+        match outcome {
+            Some(Ok((sample, label))) => {
+                let mut p = (*self.current_project()).clone();
+                let track = project_actions::append_audio_clip(&mut p, sample, label.clone());
+                self.status = format!("{label} → дорожка {}", track + 1);
+                self.publish(p);
+            }
+            Some(Err(e)) => self.status = e,
+            None => self.status = "Загрузка прервалась.".into(),
+        }
+        self.start_next_load_if_idle();
     }
 
     fn try_split_clip_at_playhead(&mut self) {
         let mut p = (*self.current_project()).clone();
         self.clip_settle_anim = None;
         project_actions::resolve_all_placement_previews(&mut p);
-        match project_actions::split_clip_at_playhead(&mut p, self.playhead_secs()) {
+        match project_actions::split_clip_at_playhead(
+            &mut p,
+            self.playhead_secs(),
+            self.selected_clip_id,
+        ) {
             Ok(id) => {
                 self.selected_clip_id = Some(id);
                 self.trim_drag = None;
@@ -269,7 +372,7 @@ impl TinySamplerApp {
         } else if space {
             self.transport_toggle_play_pause();
         } else if open_wav {
-            self.try_pick_and_load_wav();
+            self.try_pick_and_load_audio();
         } else if split_playhead {
             self.try_split_clip_at_playhead();
         } else if delete_clip {
@@ -280,25 +383,95 @@ impl TinySamplerApp {
 
 impl eframe::App for TinySamplerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_audio_load(ctx);
+        self.poll_dropped_files(ctx);
         self.handle_global_shortcuts(ctx);
 
         let btn = theme::TRANSPORT_BTN_DIAMETER;
         let btn_gap = theme::TRANSPORT_BTN_GAP;
 
+        egui::TopBottomPanel::bottom("transport")
+            .exact_height(btn + theme::TRANSPORT_RESERVE_H)
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        let total_w = btn * 3.0 + btn_gap * 2.0;
+                        ui.add_space(((ui.available_width() - total_w) * 0.5).max(0.0));
+
+                        if timeline::round_transport_btn(
+                            ui,
+                            "+",
+                            "Load audio (Ctrl+O)",
+                            theme::color_transport_load(),
+                            btn,
+                        )
+                        .clicked()
+                        {
+                            self.try_pick_and_load_audio();
+                        }
+                        ui.add_space(btn_gap);
+                        let playing = self.current_project().transport.is_playing;
+                        if playing {
+                            if timeline::round_transport_btn(
+                                ui,
+                                "⏸",
+                                "Pause (Space)",
+                                theme::color_transport_pause(),
+                                btn,
+                            )
+                            .clicked()
+                            {
+                                self.transport_toggle_play_pause();
+                            }
+                        } else if timeline::round_transport_btn(
+                            ui,
+                            "▶",
+                            "Play (Space)",
+                            theme::color_transport_play(),
+                            btn,
+                        )
+                        .clicked()
+                        {
+                            self.transport_toggle_play_pause();
+                        }
+                        ui.add_space(btn_gap);
+                        if timeline::round_transport_btn(
+                            ui,
+                            "⏹",
+                            "Stop (Ctrl+Space)",
+                            theme::color_transport_stop(),
+                            btn,
+                        )
+                        .clicked()
+                        {
+                            self.transport_stop();
+                        }
+                    });
+                    if !self.status.is_empty() {
+                        ui.add_space(2.0);
+                        ui.label(egui::RichText::new(&self.status).weak().size(12.0));
+                    }
+                });
+            });
+
         egui::CentralPanel::default().show(ctx, |ui| {
             let proj = self.current_project();
-            self.spec_cache.sync(ctx, &proj.clips);
             if let Some(id) = self.selected_clip_id {
                 if proj.clip_index(id).is_none() {
                     self.selected_clip_id = None;
                 }
             }
 
-            let timeline_height = theme::TIMELINE_TRACK_HEIGHT;
-            let transport_block_h = btn + theme::TRANSPORT_RESERVE_H;
-
             ui.vertical(|ui| {
                 let viewport_w = ui.available_width();
+                // Spare empty lane under the last clip so the next drop has a visible target.
+                let n_lanes = proj.track_count().saturating_add(1).max(2);
+                let avail_for_lanes =
+                    (ui.available_height() - theme::TIME_RULER_HEIGHT).max(80.0);
+                let lane_h = (avail_for_lanes / n_lanes as f32)
+                    .clamp(72.0, theme::TIMELINE_TRACK_HEIGHT);
+                let timeline_height = lane_h * n_lanes as f32;
                 let end_secs = proj
                     .clips
                     .iter()
@@ -312,11 +485,17 @@ impl eframe::App for TinySamplerApp {
                     Vec2::new(viewport_w, theme::TIME_RULER_HEIGHT + timeline_height),
                 );
                 if let Some(hp) = ctx.pointer_hover_pos() {
-                    if combined_rect.contains(hp) && ctx.input(|i| i.modifiers.ctrl) {
-                        let dy = ctx.input(|i| i.smooth_scroll_delta.y + i.raw_scroll_delta.y);
-                        if dy.abs() > 0.01 {
+                    if combined_rect.contains(hp) {
+                        let (ctrl, alt, dy) = ctx.input(|i| {
+                            (
+                                i.modifiers.ctrl,
+                                i.modifiers.alt,
+                                i.smooth_scroll_delta.y + i.raw_scroll_delta.y,
+                            )
+                        });
+                        if dy.abs() > 0.01 && ctrl && !alt {
                             let old_pps = self.pixels_per_second;
-                            let new_pps = (old_pps * (1.0 + dy * 0.0025))
+                            let new_pps = (old_pps * (1.0 + dy * 0.004))
                                 .clamp(theme::TIMELINE_PPS_MIN, theme::TIMELINE_PPS_MAX);
                             if (new_pps - old_pps).abs() > f32::EPSILON {
                                 let scroll = self.timeline_scroll_px;
@@ -327,6 +506,17 @@ impl eframe::App for TinySamplerApp {
                                 let max_scroll = (new_content_w - viewport_w).max(0.0);
                                 let new_scroll = combined_rect.left() + t_here * new_pps - hp.x;
                                 self.timeline_scroll_px = new_scroll.clamp(0.0, max_scroll);
+                            }
+                        } else if dy.abs() > 0.01 && alt && !ctrl {
+                            let max_scroll = {
+                                let pps = self.pixels_per_second;
+                                let content_w = (end_secs * pps).max(viewport_w);
+                                (content_w - viewport_w).max(0.0)
+                            };
+                            self.timeline_scroll_px =
+                                (self.timeline_scroll_px - dy).clamp(0.0, max_scroll);
+                            if proj.transport.is_playing {
+                                self.follow_playhead_suspended = true;
                             }
                         }
                     }
@@ -340,9 +530,11 @@ impl eframe::App for TinySamplerApp {
                     Vec2::new(viewport_w, theme::TIME_RULER_HEIGHT),
                     egui::Sense::hover(),
                 );
-                let (rect, _) =
+                let (tracks_rect, _) =
                     ui.allocate_exact_size(Vec2::new(viewport_w, timeline_height), egui::Sense::hover());
                 let view_left = ruler_rect.left();
+                let lanes_top = tracks_rect.top();
+                let lane_h = (tracks_rect.height() / n_lanes as f32).max(1.0);
 
                 let pan_resp = ui.interact(
                     combined_rect,
@@ -367,20 +559,33 @@ impl eframe::App for TinySamplerApp {
                 } else if let Some(clip_id) = self.clip_move_drag {
                     if ctx.input(|i| i.pointer.primary_down()) {
                         let dx = ctx.input(|i| i.pointer.delta().x);
+                        let mut p = (*self.current_project()).clone();
+                        let allow_overlap = p
+                            .clip_index(clip_id)
+                            .is_some_and(|i| p.clips[i].placement_preview);
+                        let mut changed = false;
                         if dx != 0.0 {
-                            let mut p = (*self.current_project()).clone();
-                            let allow_overlap = p
-                                .clip_index(clip_id)
-                                .is_some_and(|i| p.clips[i].placement_preview);
-                            if project_actions::nudge_clip_time_by_drag(
+                            changed |= project_actions::nudge_clip_time_by_drag(
                                 &mut p,
                                 clip_id,
                                 dx,
                                 pps,
                                 allow_overlap,
-                            ) {
-                                self.publish(p);
-                            }
+                            );
+                        }
+                        if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
+                            let max_track = p
+                                .clips
+                                .iter()
+                                .map(|c| c.track_index)
+                                .max()
+                                .unwrap_or(0)
+                                .saturating_add(1);
+                            let t = timeline::track_index_at_y(pos.y, lanes_top, lane_h, max_track);
+                            changed |= project_actions::set_clip_track(&mut p, clip_id, t);
+                        }
+                        if changed {
+                            self.publish(p);
                         }
                     } else {
                         self.clip_move_drag = None;
@@ -388,54 +593,56 @@ impl eframe::App for TinySamplerApp {
                         self.finish_clip_preview_drop(ctx, clip_id);
                     }
                 }
-                if ctx.input(|i| i.pointer.primary_pressed()) {
+                if ctx.input(|i| i.pointer.primary_pressed())
+                    && self.trim_drag.is_none()
+                    && self.clip_move_drag.is_none()
+                {
                     let proj_now = self.current_project();
-                    if !proj_now.transport.is_playing {
-                        if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
-                            if combined_rect.contains(pos) && rect.contains(pos) {
-                                if let Some(sel) = self.selected_clip_id {
-                                    if proj_now.clip_index(sel).is_some() {
-                                        if let Some(d) = timeline::trim_hit_test(
-                                            &proj_now,
-                                            sel,
-                                            pos,
-                                            rect,
-                                            view_left,
-                                            pps,
-                                            self.timeline_scroll_px,
-                                            proj_now.device_sample_rate,
-                                        ) {
-                                            self.trim_drag = Some(d);
-                                        } else if let Some(clip) =
-                                            proj_now.clips.iter().find(|c| c.id == sel)
+                    if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
+                        if combined_rect.contains(pos) && tracks_rect.contains(pos) {
+                            let sel = self.selected_clip_id.filter(|id| proj_now.clip_index(*id).is_some());
+                            if let Some(sel) = sel {
+                                if let Some(d) = timeline::trim_hit_test(
+                                    &proj_now,
+                                    sel,
+                                    pos,
+                                    lanes_top,
+                                    lane_h,
+                                    view_left,
+                                    pps,
+                                    self.timeline_scroll_px,
+                                    proj_now.device_sample_rate,
+                                ) {
+                                    self.trim_drag = Some(d);
+                                }
+                            }
+                            if self.trim_drag.is_none() {
+                                if let Some(id) = timeline::clip_id_at_pointer(
+                                    &proj_now,
+                                    pos,
+                                    lanes_top,
+                                    lane_h,
+                                    view_left,
+                                    pps,
+                                    self.timeline_scroll_px,
+                                    proj_now.device_sample_rate,
+                                ) {
+                                    self.selected_clip_id = Some(id);
+                                    let alt = ctx.input(|i| i.modifiers.alt);
+                                    if alt {
+                                        let mut p = (*proj_now).clone();
+                                        if let Some(new_id) =
+                                            project_actions::duplicate_clip(&mut p, id)
                                         {
-                                            let cr = timeline::clip_rect_on_timeline(
-                                                clip,
-                                                rect,
-                                                view_left,
-                                                pps,
-                                                self.timeline_scroll_px,
-                                                proj_now.device_sample_rate,
-                                            );
-                                            if cr.contains(pos) {
-                                                let alt = ctx.input(|i| i.modifiers.alt);
-                                                if alt {
-                                                    let mut p = (*proj_now).clone();
-                                                    if let Some(new_id) =
-                                                        project_actions::duplicate_clip(&mut p, sel)
-                                                    {
-                                                        self.selected_clip_id = Some(new_id);
-                                                        self.clip_move_from_alt_duplicate = true;
-                                                        self.clip_move_drag = Some(new_id);
-                                                        self.publish(p);
-                                                    } else {
-                                                        self.begin_clip_body_drag(&proj_now, sel, false);
-                                                    }
-                                                } else {
-                                                    self.begin_clip_body_drag(&proj_now, sel, false);
-                                                }
-                                            }
+                                            self.selected_clip_id = Some(new_id);
+                                            self.clip_move_from_alt_duplicate = true;
+                                            self.clip_move_drag = Some(new_id);
+                                            self.publish(p);
+                                        } else {
+                                            self.begin_clip_body_drag(&proj_now, id, false);
                                         }
+                                    } else {
+                                        self.begin_clip_body_drag(&proj_now, id, false);
                                     }
                                 }
                             }
@@ -452,6 +659,9 @@ impl eframe::App for TinySamplerApp {
                 {
                     self.timeline_scroll_px =
                         (self.timeline_scroll_px - pan_resp.drag_delta().x).clamp(0.0, max_scroll);
+                    if proj.transport.is_playing {
+                        self.follow_playhead_suspended = true;
+                    }
                     ctx.set_cursor_icon(CursorIcon::Grabbing);
                 } else if self.trim_drag.is_some() || self.clip_move_drag.is_some() {
                     let ghost_drag = self.clip_move_drag.is_some_and(|cid| {
@@ -472,25 +682,25 @@ impl eframe::App for TinySamplerApp {
                         &proj,
                         self.selected_clip_id,
                         hp,
-                        rect,
+                        lanes_top,
+                        lane_h,
                         view_left,
                         pps,
                         self.timeline_scroll_px,
                         proj.device_sample_rate,
-                    ) && !proj.transport.is_playing
-                    {
+                    ) {
                         ctx.set_cursor_icon(CursorIcon::ResizeHorizontal);
                     } else if timeline::pointer_on_selected_clip_move_body(
                         &proj,
                         self.selected_clip_id,
                         hp,
-                        rect,
+                        lanes_top,
+                        lane_h,
                         view_left,
                         pps,
                         self.timeline_scroll_px,
                         proj.device_sample_rate,
-                    ) && !proj.transport.is_playing
-                    {
+                    ) {
                         if ctx.input(|i| i.modifiers.alt) {
                             ctx.set_cursor_icon(CursorIcon::Alias);
                         } else {
@@ -507,7 +717,8 @@ impl eframe::App for TinySamplerApp {
                         if let Some(id) = timeline::clip_id_at_pointer(
                             &proj,
                             p,
-                            rect,
+                            lanes_top,
+                            lane_h,
                             view_left,
                             pps,
                             sc,
@@ -518,24 +729,43 @@ impl eframe::App for TinySamplerApp {
                             self.selected_clip_id = None;
                             let time_at =
                                 |x: f32| -> f32 { (((x - view_left) + sc) / pps).max(0.0) };
-                            if ruler_rect.contains(p) || rect.contains(p) {
+                            if ruler_rect.contains(p) || tracks_rect.contains(p) {
                                 let t = time_at(p.x);
                                 self.request_seek(t);
                                 self.timeline_scroll_px =
                                     (view_left + t * pps - p.x).clamp(0.0, max_scroll);
+                                self.follow_playhead_suspended = false;
                             }
                         }
                     }
                 }
 
                 if proj.transport.is_playing {
-                    self.timeline_scroll_px = timeline::scroll_keep_playhead_in_view(
-                        rect,
-                        self.playhead_secs(),
-                        pps,
-                        max_scroll,
-                        self.timeline_scroll_px,
-                    );
+                    if self.follow_playhead_suspended {
+                        if timeline::playhead_in_viewport(
+                            tracks_rect,
+                            self.playhead_secs(),
+                            pps,
+                            self.timeline_scroll_px,
+                        ) {
+                            self.follow_playhead_suspended = false;
+                            self.timeline_scroll_px = timeline::scroll_keep_playhead_in_view(
+                                tracks_rect,
+                                self.playhead_secs(),
+                                pps,
+                                max_scroll,
+                                self.timeline_scroll_px,
+                            );
+                        }
+                    } else {
+                        self.timeline_scroll_px = timeline::scroll_keep_playhead_in_view(
+                            tracks_rect,
+                            self.playhead_secs(),
+                            pps,
+                            max_scroll,
+                            self.timeline_scroll_px,
+                        );
+                    }
                 }
 
                 let scroll = self.timeline_scroll_px;
@@ -554,9 +784,31 @@ impl eframe::App for TinySamplerApp {
                     );
                 }
 
-                let painter = ui.painter_at(rect);
-                painter.rect_filled(rect, 4.0, theme::color_timeline_bg());
-                painter.rect_stroke(rect, 4.0, Stroke::new(1.0, theme::color_timeline_border()));
+                let painter = ui.painter_at(tracks_rect);
+                for lane in 0..n_lanes {
+                    let lane_rect = Rect::from_min_size(
+                        Pos2::new(tracks_rect.left(), lanes_top + lane as f32 * lane_h),
+                        Vec2::new(tracks_rect.width(), lane_h),
+                    );
+                    let bg = if lane % 2 == 0 {
+                        theme::color_timeline_bg()
+                    } else {
+                        theme::color_timeline_bg_alt()
+                    };
+                    painter.rect_filled(lane_rect, 0.0, bg);
+                    painter.text(
+                        Pos2::new(lane_rect.left() + 6.0, lane_rect.top() + 4.0),
+                        egui::Align2::LEFT_TOP,
+                        format!("{}", lane + 1),
+                        egui::FontId::proportional(11.0),
+                        Color32::from_gray(140),
+                    );
+                }
+                painter.rect_stroke(
+                    tracks_rect,
+                    4.0,
+                    Stroke::new(1.0_f32, theme::color_timeline_border()),
+                );
 
                 let mut clip_draw_order: Vec<usize> = (0..proj.clips.len()).collect();
                 clip_draw_order.sort_by_key(|&i| proj.clips[i].placement_preview);
@@ -564,38 +816,29 @@ impl eframe::App for TinySamplerApp {
                 for &i in &clip_draw_order {
                     let clip = &proj.clips[i];
                     let ghost = clip.placement_preview;
-                    let dur = clip.timeline_duration_secs(proj.device_sample_rate);
-                    let x0 = to_screen(clip.start_time_secs);
-                    let w = dur * pps;
-                    let clip_rect = Rect::from_min_size(
-                        Pos2::new(x0, rect.top() + 20.0),
-                        Vec2::new(w.max(8.0), rect.height() - 40.0),
+                    let clip_rect = timeline::clip_rect_on_timeline(
+                        clip,
+                        lanes_top,
+                        lane_h,
+                        view_left,
+                        pps,
+                        scroll,
+                        proj.device_sample_rate,
                     );
 
-                    if let Some(tex) = self.spec_cache.texture_at(i) {
-                        let n = clip.sample.data.len().max(1);
-                        let u0 = clip.trim_start as f32 / n as f32;
-                        let u1 = clip.trim_end as f32 / n as f32;
-                        let uv = Rect::from_min_max(Pos2::new(u0, 0.0), Pos2::new(u1, 1.0));
-                        let tint = if ghost {
-                            Color32::from_rgba_unmultiplied(200, 230, 255, 150)
-                        } else {
-                            Color32::WHITE
-                        };
-                        painter.image(tex.id(), clip_rect, uv, tint);
+                    let fill = if ghost {
+                        theme::color_clip_bg().gamma_multiply(0.55)
                     } else {
-                        let fill = if ghost {
-                            theme::color_clip_fallback().gamma_multiply(0.5)
-                        } else {
-                            theme::color_clip_fallback()
-                        };
-                        painter.rect_filled(clip_rect, 3.0, fill);
-                    }
+                        theme::color_clip_bg()
+                    };
+                    painter.rect_filled(clip_rect, 3.0, fill);
 
                     paint_waveform_overlay(
                         &painter,
                         clip_rect,
+                        tracks_rect,
                         &clip.sample.data,
+                        &clip.sample.peaks,
                         clip.trim_start,
                         clip.trim_end,
                         ghost,
@@ -666,7 +909,7 @@ impl eframe::App for TinySamplerApp {
                         cross_painter.line_segment(
                             [
                                 Pos2::new(gx, combined_rect.top()),
-                                Pos2::new(gx, rect.bottom()),
+                                Pos2::new(gx, tracks_rect.bottom()),
                             ],
                             Stroke::new(1.5, theme::color_playhead_cross()),
                         );
@@ -676,74 +919,11 @@ impl eframe::App for TinySamplerApp {
                 let play_x = to_screen(self.playhead_secs());
                 painter.line_segment(
                     [
-                        Pos2::new(play_x, rect.top()),
-                        Pos2::new(play_x, rect.bottom()),
+                        Pos2::new(play_x, tracks_rect.top()),
+                        Pos2::new(play_x, tracks_rect.bottom()),
                     ],
                     Stroke::new(2.0, theme::color_playhead()),
                 );
-
-                let gap_before_transport = (ui.available_height() - transport_block_h).max(0.0);
-                ui.add_space(gap_before_transport);
-
-                ui.vertical_centered(|ui| {
-                    ui.horizontal(|ui| {
-                        let total_w = btn * 3.0 + btn_gap * 2.0;
-                        ui.add_space(((ui.available_width() - total_w) * 0.5).max(0.0));
-
-                        if timeline::round_transport_btn(
-                            ui,
-                            "+",
-                            "Load WAV (Ctrl+O)",
-                            theme::color_transport_load(),
-                            btn,
-                        )
-                        .clicked()
-                        {
-                            self.try_pick_and_load_wav();
-                        }
-                        ui.add_space(btn_gap);
-                        let playing = self.current_project().transport.is_playing;
-                        if playing {
-                            if timeline::round_transport_btn(
-                                ui,
-                                "⏸",
-                                "Pause (Space)",
-                                theme::color_transport_pause(),
-                                btn,
-                            )
-                            .clicked()
-                            {
-                                self.transport_toggle_play_pause();
-                            }
-                        } else if timeline::round_transport_btn(
-                            ui,
-                            "▶",
-                            "Play (Space)",
-                            theme::color_transport_play(),
-                            btn,
-                        )
-                        .clicked()
-                        {
-                            self.transport_toggle_play_pause();
-                        }
-                        ui.add_space(btn_gap);
-                        if timeline::round_transport_btn(
-                            ui,
-                            "⏹",
-                            "Stop (Ctrl+Space)",
-                            theme::color_transport_stop(),
-                            btn,
-                        )
-                        .clicked()
-                        {
-                            self.transport_stop();
-                        }
-                    });
-                    if !self.status.is_empty() {
-                        ui.add_space(4.0);
-                        ui.label(egui::RichText::new(&self.status).weak().size(12.0));
-                    }
-                });
 
                 if ctx.input(|i| i.pointer.primary_clicked()) {
                     if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
@@ -759,61 +939,80 @@ impl eframe::App for TinySamplerApp {
     }
 }
 
-/// Min/max envelope per screen column, semi-transparent on top of spectrogram.
-/// Work is bounded: long clips would otherwise scan every sample every frame (jank after trim).
+/// Audacity-style filled min/max envelope (mono). Only paints columns inside `view_rect`.
 fn paint_waveform_overlay(
     painter: &egui::Painter,
     clip_rect: Rect,
+    view_rect: Rect,
     data: &[f32],
+    peaks: &PeakPyramid,
     trim_start: usize,
     trim_end: usize,
     ghost: bool,
 ) {
-    const MAX_COLS: usize = 1200;
-    const MAX_SAMPLES_PER_COL: usize = 256;
-
     let vis = trim_end.saturating_sub(trim_start);
     if vis == 0 {
         return;
     }
+    let vis_rect = clip_rect.intersect(view_rect);
+    if vis_rect.width() < 0.5 || vis_rect.height() < 0.5 {
+        return;
+    }
+
     let pixel_w = clip_rect.width().max(1.0);
-    let cols = (pixel_w.ceil() as usize).clamp(1, MAX_COLS);
+    let vis_f = vis as f32;
     let center_y = clip_rect.center().y;
     let half_h = ((clip_rect.height() - 4.0).max(4.0)) * 0.5;
-    let stroke_col = if ghost {
-        Color32::from_rgba_unmultiplied(255, 255, 255, 130)
-    } else {
-        Color32::from_rgba_unmultiplied(255, 255, 255, 95)
-    };
-    let stroke = Stroke::new(1.0, stroke_col);
-    let clip_painter = painter.with_clip_rect(clip_rect);
-    for col in 0..cols {
-        let frac = (col as f32 + 0.5) / cols as f32;
-        let x = clip_rect.left() + frac * pixel_w;
-        let i0 = trim_start + col * vis / cols;
-        let i1 = trim_start + ((col + 1) * vis / cols).max(i0 + 1).min(trim_end);
-        let span = i1 - i0;
-        let inner = span.min(MAX_SAMPLES_PER_COL).max(1);
-        let mut mn = f32::INFINITY;
-        let mut mx = f32::NEG_INFINITY;
-        for k in 0..inner {
-            let off = if inner <= 1 {
-                0usize
-            } else {
-                k * (span - 1) / (inner - 1)
-            };
-            let idx = i0 + off;
-            let Some(&s) = data.get(idx) else {
-                continue;
-            };
-            mn = mn.min(s);
-            mx = mx.max(s);
-        }
-        if !mn.is_finite() || !mx.is_finite() {
+    let y_of = |s: f32| center_y - s.clamp(-1.0, 1.0) * half_h;
+
+    let mut wave_col = theme::color_clip_waveform();
+    let mut zero_col = theme::color_clip_zero_line();
+    if ghost {
+        wave_col = Color32::from_rgba_unmultiplied(wave_col.r(), wave_col.g(), wave_col.b(), 140);
+        zero_col = Color32::from_rgba_unmultiplied(zero_col.r(), zero_col.g(), zero_col.b(), 90);
+    }
+
+    let clip_painter = painter.with_clip_rect(vis_rect);
+    clip_painter.line_segment(
+        [
+            Pos2::new(vis_rect.left(), center_y),
+            Pos2::new(vis_rect.right(), center_y),
+        ],
+        Stroke::new(1.0_f32, zero_col),
+    );
+
+    let x0 = vis_rect.left().floor() as i32;
+    let x1 = vis_rect.right().ceil() as i32;
+    for x in x0..x1 {
+        let xf = x as f32;
+        let u0 = ((xf - clip_rect.left()) / pixel_w).clamp(0.0, 1.0);
+        let u1 = ((xf + 1.0 - clip_rect.left()) / pixel_w).clamp(0.0, 1.0);
+        if u1 <= u0 {
             continue;
         }
-        let y_top = center_y - mx * half_h;
-        let y_bot = center_y - mn * half_h;
-        clip_painter.line_segment([Pos2::new(x, y_top), Pos2::new(x, y_bot)], stroke);
+        let s0 = trim_start as f32 + u0 * vis_f;
+        let s1 = trim_start as f32 + u1 * vis_f;
+        let (mn, mx) = if (s1 - s0) <= 1.0 {
+            let a = crate::waveform::sample_at(data, s0);
+            let b = crate::waveform::sample_at(data, s1.max(s0 + 1e-4));
+            (a.min(b), a.max(b))
+        } else {
+            crate::waveform::min_max_range(data, peaks, s0.floor() as usize, s1.ceil() as usize)
+        };
+        let mut yt = y_of(mx);
+        let mut yb = y_of(mn);
+        if yb < yt {
+            std::mem::swap(&mut yt, &mut yb);
+        }
+        if yb - yt < 1.0 {
+            let mid = (yt + yb) * 0.5;
+            yt = mid - 0.5;
+            yb = mid + 0.5;
+        }
+        clip_painter.rect_filled(
+            Rect::from_min_max(Pos2::new(xf, yt), Pos2::new(xf + 1.0, yb)),
+            0.0,
+            wave_col,
+        );
     }
 }

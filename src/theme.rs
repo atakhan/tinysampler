@@ -2,9 +2,10 @@
 
 use egui::Color32;
 
-/// Same range as the "px / sec" slider; Ctrl+wheel on the timeline uses these bounds.
-pub const TIMELINE_PPS_MIN: f32 = 40.0;
-pub const TIMELINE_PPS_MAX: f32 = 300.0;
+/// Ctrl+wheel zoom. Wide range so you can see a whole hour or individual samples.
+/// Finite only to keep `f32` math and the ruler from blowing up.
+pub const TIMELINE_PPS_MIN: f32 = 0.01;
+pub const TIMELINE_PPS_MAX: f32 = 2_000_000.0;
 
 /// While playing, nudge horizontal scroll if the playhead gets closer than this to a viewport edge.
 pub const PLAYHEAD_EDGE_MARGIN_PX: f32 = 48.0;
@@ -46,12 +47,24 @@ pub fn color_timeline_bg() -> Color32 {
     Color32::from_rgb(30, 30, 36)
 }
 
+pub fn color_timeline_bg_alt() -> Color32 {
+    Color32::from_rgb(38, 38, 46)
+}
+
 pub fn color_timeline_border() -> Color32 {
     Color32::from_gray(80)
 }
 
-pub fn color_clip_fallback() -> Color32 {
-    Color32::from_rgb(50, 90, 160)
+pub fn color_clip_bg() -> Color32 {
+    Color32::from_rgb(186, 190, 236)
+}
+
+pub fn color_clip_waveform() -> Color32 {
+    Color32::from_rgb(42, 42, 56)
+}
+
+pub fn color_clip_zero_line() -> Color32 {
+    Color32::from_rgb(120, 124, 180)
 }
 
 pub fn color_playhead() -> Color32 {

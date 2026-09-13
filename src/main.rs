@@ -1,14 +1,13 @@
-//! Tiny sampler desktop prototype: WAV → timeline → cpal (no rodio).
+//! Tiny sampler desktop prototype: WAV/MP3 → timeline → cpal (no rodio).
 
 mod app;
 mod audio;
 mod mix;
 mod model;
 mod project_actions;
-mod spectrogram;
-mod spec_textures;
 mod theme;
 mod timeline;
+mod waveform;
 mod wav_loader;
 
 fn main() -> eframe::Result<()> {
@@ -24,8 +23,9 @@ fn main() -> eframe::Result<()> {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([960.0, 540.0])
-            .with_title("tinysampler"),
+            .with_inner_size([960.0, 640.0])
+            .with_title("tinysampler")
+            .with_drag_and_drop(true),
         ..Default::default()
     };
 
