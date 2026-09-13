@@ -13,6 +13,15 @@ pub const PLAYHEAD_EDGE_MARGIN_PX: f32 = 48.0;
 /// Time scale bar height at the top of the timeline stack.
 pub const TIME_RULER_HEIGHT: f32 = 30.0;
 
+/// Tempo / ruler-mode strip above the time ruler.
+pub const TEMPO_BAR_HEIGHT: f32 = 36.0;
+
+/// Cue strip above each track's clips.
+pub const MARKER_LANE_HEIGHT: f32 = 26.0;
+
+/// Left track-select column.
+pub const TRACK_GUTTER_WIDTH: f32 = 40.0;
+
 /// Horizontal hit width for trim handles on a selected clip.
 pub const TRIM_HANDLE_WIDTH_PX: f32 = 10.0;
 
@@ -93,4 +102,24 @@ pub fn color_ruler_text() -> Color32 {
 
 pub fn color_ruler_bottom_line() -> Color32 {
     Color32::from_gray(55)
+}
+
+pub fn color_marker() -> Color32 {
+    Color32::from_rgb(230, 180, 64)
+}
+
+pub fn color_marker_lane_bg() -> Color32 {
+    Color32::from_rgb(20, 20, 26)
+}
+
+pub fn color_marker_delete() -> Color32 {
+    Color32::from_rgb(40, 36, 36)
+}
+
+pub fn color_track_gutter() -> Color32 {
+    Color32::from_rgb(22, 22, 28)
+}
+
+pub fn color_track_gutter_selected() -> Color32 {
+    Color32::from_rgb(48, 70, 118)
 }

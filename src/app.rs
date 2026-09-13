@@ -43,6 +43,10 @@ pub struct TinySamplerApp {
     /// Play: user panned away; edge-follow waits until the playhead is on screen again.
     follow_playhead_suspended: bool,
     pending_loads: VecDeque<PathBuf>,
+    selected_marker: Option<(u8, usize)>,
+    marker_drag: Option<(u8, usize)>,
+    selected_track: usize,
+    ruler_kind: timeline::RulerKind,
 }
 
 impl TinySamplerApp {
@@ -79,6 +83,10 @@ impl TinySamplerApp {
             load_rx: None,
             follow_playhead_suspended: false,
             pending_loads: VecDeque::new(),
+            selected_marker: None,
+            marker_drag: None,
+            selected_track: 0,
+            ruler_kind: timeline::RulerKind::Time,
         })
     }
 
@@ -199,6 +207,7 @@ impl TinySamplerApp {
         self.clip_settle_anim = None;
         self.seek_pending.store(false, Ordering::Release);
         self.follow_playhead_suspended = false;
+        self.marker_drag = None;
     }
 
     fn try_pick_and_load_audio(&mut self) {
@@ -354,19 +363,30 @@ impl TinySamplerApp {
         if ctx.wants_keyboard_input() {
             return;
         }
-        let (ctrl_space, space, open_wav, split_playhead, delete_clip) = ctx.input(|i| {
-            let space = i.key_pressed(Key::Space);
-            let open_wav = i.key_pressed(Key::O) && (i.modifiers.ctrl || i.modifiers.command);
-            let split_playhead = i.key_pressed(Key::K) && (i.modifiers.ctrl || i.modifiers.command);
-            let delete_clip = i.key_pressed(Key::Delete);
-            (
-                space && i.modifiers.ctrl,
-                space && !i.modifiers.ctrl,
-                open_wav,
-                split_playhead,
-                delete_clip,
-            )
-        });
+        let (ctrl_space, space, open_wav, split_playhead, delete_clip, place_marker, play_marker_slot) =
+            ctx.input(|i| {
+                let mods = i.modifiers.ctrl || i.modifiers.command || i.modifiers.alt;
+                let space = i.key_pressed(Key::Space);
+                let open_wav = i.key_pressed(Key::O) && (i.modifiers.ctrl || i.modifiers.command);
+                let split_playhead =
+                    i.key_pressed(Key::K) && (i.modifiers.ctrl || i.modifiers.command);
+                let delete_clip = i.key_pressed(Key::Delete);
+                let place_marker = i.key_pressed(Key::M) && !mods;
+                let play_marker_slot = if mods {
+                    None
+                } else {
+                    marker_slot_from_keys(i)
+                };
+                (
+                    space && i.modifiers.ctrl,
+                    space && !i.modifiers.ctrl,
+                    open_wav,
+                    split_playhead,
+                    delete_clip,
+                    place_marker,
+                    play_marker_slot,
+                )
+            });
         if ctrl_space {
             self.transport_stop();
         } else if space {
@@ -376,19 +396,146 @@ impl TinySamplerApp {
         } else if split_playhead {
             self.try_split_clip_at_playhead();
         } else if delete_clip {
-            self.delete_selected_clip();
+            if self.selected_marker.is_some() {
+                self.delete_selected_marker();
+            } else {
+                self.delete_selected_clip();
+            }
+        } else if place_marker {
+            self.try_place_marker_at_playhead();
+        } else if let Some(slot) = play_marker_slot {
+            self.play_from_marker(slot);
         }
     }
+
+    fn try_place_marker_at_playhead(&mut self) {
+        let t = self.playhead_secs();
+        let mut p = (*self.current_project()).clone();
+        match project_actions::try_place_marker(&mut p, t, self.selected_track) {
+            Some(slot) => {
+                self.status = format!("Метка {slot} · дорожка {}", self.selected_track + 1);
+                self.selected_marker = Some((slot, self.selected_track));
+                self.selected_clip_id = None;
+                self.publish(p);
+            }
+            None => {
+                self.status = format!(
+                    "Все метки 1–9 на дорожке {} заняты",
+                    self.selected_track + 1
+                );
+            }
+        }
+    }
+
+    fn play_from_marker(&mut self, slot: u8) {
+        let Some(t) = project_actions::marker_time(
+            &self.current_project(),
+            slot,
+            self.selected_track,
+        ) else {
+            return;
+        };
+        self.request_seek(t);
+        self.playhead_bits.store(t.to_bits(), Ordering::Relaxed);
+        self.follow_playhead_suspended = false;
+        self.selected_marker = Some((slot, self.selected_track));
+        let mut p = (*self.current_project()).clone();
+        if !p.transport.is_playing {
+            p.transport.is_playing = true;
+            self.trim_drag = None;
+            self.clip_move_drag = None;
+            self.clip_move_from_alt_duplicate = false;
+            self.clip_settle_anim = None;
+            project_actions::resolve_all_placement_previews(&mut p);
+        }
+        self.publish(p);
+    }
+
+    fn delete_selected_marker(&mut self) {
+        let Some((slot, track)) = self.selected_marker else {
+            return;
+        };
+        let mut p = (*self.current_project()).clone();
+        if project_actions::delete_marker(&mut p, slot, track) {
+            self.selected_marker = None;
+            self.marker_drag = None;
+            self.status = format!("Метка {slot} удалена");
+            self.publish(p);
+        }
+    }
+}
+
+fn marker_slot_from_keys(i: &egui::InputState) -> Option<u8> {
+    const KEYS: [(Key, u8); 9] = [
+        (Key::Num1, 1),
+        (Key::Num2, 2),
+        (Key::Num3, 3),
+        (Key::Num4, 4),
+        (Key::Num5, 5),
+        (Key::Num6, 6),
+        (Key::Num7, 7),
+        (Key::Num8, 8),
+        (Key::Num9, 9),
+    ];
+    KEYS.into_iter()
+        .find(|(k, _)| i.key_pressed(*k))
+        .map(|(_, slot)| slot)
 }
 
 impl eframe::App for TinySamplerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_audio_load(ctx);
         self.poll_dropped_files(ctx);
+        if let Some(msg) = self.engine.recover_if_needed(&self.project_swap) {
+            self.status = msg;
+        }
         self.handle_global_shortcuts(ctx);
 
         let btn = theme::TRANSPORT_BTN_DIAMETER;
         let btn_gap = theme::TRANSPORT_BTN_GAP;
+
+        egui::TopBottomPanel::top("tempo_bar")
+            .exact_height(theme::TEMPO_BAR_HEIGHT)
+            .show(ctx, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new("Темп").weak());
+                    let mut bpm = self.current_project().tempo_bpm;
+                    let tempo_edit = ui.add(
+                        egui::DragValue::new(&mut bpm)
+                            .suffix(" BPM")
+                            .range(20.0..=400.0)
+                            .speed(0.25)
+                            .min_decimals(0)
+                            .max_decimals(1),
+                    );
+                    if tempo_edit.changed() {
+                        let mut p = (*self.current_project()).clone();
+                        p.tempo_bpm = bpm.clamp(20.0, 400.0);
+                        self.publish(p);
+                    }
+                    ui.add_space(16.0);
+                    ui.label(egui::RichText::new("Линейка").weak());
+                    if ui
+                        .selectable_label(
+                            self.ruler_kind == timeline::RulerKind::Time,
+                            "Время",
+                        )
+                        .clicked()
+                    {
+                        self.ruler_kind = timeline::RulerKind::Time;
+                    }
+                    if ui
+                        .selectable_label(
+                            self.ruler_kind == timeline::RulerKind::Tempo,
+                            "Темп",
+                        )
+                        .clicked()
+                    {
+                        self.ruler_kind = timeline::RulerKind::Tempo;
+                    }
+                });
+            });
 
         egui::TopBottomPanel::bottom("transport")
             .exact_height(btn + theme::TRANSPORT_RESERVE_H)
@@ -467,17 +614,26 @@ impl eframe::App for TinySamplerApp {
                 let viewport_w = ui.available_width();
                 // Spare empty lane under the last clip so the next drop has a visible target.
                 let n_lanes = proj.track_count().saturating_add(1).max(2);
-                let avail_for_lanes =
-                    (ui.available_height() - theme::TIME_RULER_HEIGHT).max(80.0);
-                let lane_h = (avail_for_lanes / n_lanes as f32)
-                    .clamp(72.0, theme::TIMELINE_TRACK_HEIGHT);
-                let timeline_height = lane_h * n_lanes as f32;
+                self.selected_track = self.selected_track.min(n_lanes.saturating_sub(1));
+                let gutter_w = theme::TRACK_GUTTER_WIDTH;
+                let avail_for_lanes = (ui.available_height() - theme::TIME_RULER_HEIGHT).max(80.0);
+                let block_h = (avail_for_lanes / n_lanes as f32).clamp(
+                    theme::MARKER_LANE_HEIGHT + 72.0,
+                    theme::TIMELINE_TRACK_HEIGHT + theme::MARKER_LANE_HEIGHT,
+                );
+                let timeline_height = block_h * n_lanes as f32;
+                let marker_end = proj
+                    .markers
+                    .iter()
+                    .map(|m| m.time_secs)
+                    .fold(0.0f32, f32::max);
                 let end_secs = proj
                     .clips
                     .iter()
                     .map(|c| c.start_time_secs + c.timeline_duration_secs(proj.device_sample_rate))
                     .fold(4.0f32, f32::max)
-                    .max(self.playhead_secs() + 0.5);
+                    .max(self.playhead_secs() + 0.5)
+                    .max(marker_end + 0.5);
 
                 let stack_origin = ui.cursor().min;
                 let combined_rect = Rect::from_min_size(
@@ -499,19 +655,23 @@ impl eframe::App for TinySamplerApp {
                                 .clamp(theme::TIMELINE_PPS_MIN, theme::TIMELINE_PPS_MAX);
                             if (new_pps - old_pps).abs() > f32::EPSILON {
                                 let scroll = self.timeline_scroll_px;
-                                let t_here =
-                                    (((hp.x - combined_rect.left()) + scroll) / old_pps).max(0.0);
+                                let t_here = (((hp.x - (stack_origin.x + gutter_w)) + scroll)
+                                    / old_pps)
+                                    .max(0.0);
                                 self.pixels_per_second = new_pps;
-                                let new_content_w = (end_secs * new_pps).max(viewport_w);
-                                let max_scroll = (new_content_w - viewport_w).max(0.0);
-                                let new_scroll = combined_rect.left() + t_here * new_pps - hp.x;
+                                let timeline_w = (viewport_w - gutter_w).max(1.0);
+                                let new_content_w = (end_secs * new_pps).max(timeline_w);
+                                let max_scroll = (new_content_w - timeline_w).max(0.0);
+                                let view_left = stack_origin.x + gutter_w;
+                                let new_scroll = view_left + t_here * new_pps - hp.x;
                                 self.timeline_scroll_px = new_scroll.clamp(0.0, max_scroll);
                             }
                         } else if dy.abs() > 0.01 && alt && !ctrl {
+                            let timeline_w = (viewport_w - gutter_w).max(1.0);
                             let max_scroll = {
                                 let pps = self.pixels_per_second;
-                                let content_w = (end_secs * pps).max(viewport_w);
-                                (content_w - viewport_w).max(0.0)
+                                let content_w = (end_secs * pps).max(timeline_w);
+                                (content_w - timeline_w).max(0.0)
                             };
                             self.timeline_scroll_px =
                                 (self.timeline_scroll_px - dy).clamp(0.0, max_scroll);
@@ -523,18 +683,31 @@ impl eframe::App for TinySamplerApp {
                 }
 
                 let pps = self.pixels_per_second;
-                let content_w = (end_secs * pps).max(viewport_w);
-                let max_scroll = (content_w - viewport_w).max(0.0);
+                let timeline_w = (viewport_w - gutter_w).max(1.0);
+                let content_w = (end_secs * pps).max(timeline_w);
+                let max_scroll = (content_w - timeline_w).max(0.0);
 
-                let (ruler_rect, _) = ui.allocate_exact_size(
+                let (ruler_row, _) = ui.allocate_exact_size(
                     Vec2::new(viewport_w, theme::TIME_RULER_HEIGHT),
                     egui::Sense::hover(),
                 );
+                let ruler_gutter = Rect::from_min_size(
+                    ruler_row.min,
+                    Vec2::new(gutter_w, ruler_row.height()),
+                );
+                let ruler_rect = Rect::from_min_max(
+                    Pos2::new(ruler_row.left() + gutter_w, ruler_row.top()),
+                    ruler_row.max,
+                );
                 let (tracks_rect, _) =
                     ui.allocate_exact_size(Vec2::new(viewport_w, timeline_height), egui::Sense::hover());
-                let view_left = ruler_rect.left();
-                let lanes_top = tracks_rect.top();
-                let lane_h = (tracks_rect.height() / n_lanes as f32).max(1.0);
+                let layout = timeline::TrackLayout {
+                    area: tracks_rect,
+                    n_lanes,
+                    gutter_w,
+                    marker_h: theme::MARKER_LANE_HEIGHT,
+                };
+                let view_left = layout.content_left();
 
                 let pan_resp = ui.interact(
                     combined_rect,
@@ -574,14 +747,7 @@ impl eframe::App for TinySamplerApp {
                             );
                         }
                         if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
-                            let max_track = p
-                                .clips
-                                .iter()
-                                .map(|c| c.track_index)
-                                .max()
-                                .unwrap_or(0)
-                                .saturating_add(1);
-                            let t = timeline::track_index_at_y(pos.y, lanes_top, lane_h, max_track);
+                            let t = timeline::track_index_at_y(pos.y, &layout);
                             changed |= project_actions::set_clip_track(&mut p, clip_id, t);
                         }
                         if changed {
@@ -592,22 +758,65 @@ impl eframe::App for TinySamplerApp {
                         self.clip_move_from_alt_duplicate = false;
                         self.finish_clip_preview_drop(ctx, clip_id);
                     }
+                } else if let Some((slot, track)) = self.marker_drag {
+                    if ctx.input(|i| i.pointer.primary_down()) {
+                        if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
+                            let t = (((pos.x - view_left) + self.timeline_scroll_px) / pps).max(0.0);
+                            let mut p = (*self.current_project()).clone();
+                            if project_actions::move_marker(&mut p, slot, track, t) {
+                                self.publish(p);
+                            }
+                        }
+                    } else {
+                        self.marker_drag = None;
+                    }
                 }
                 if ctx.input(|i| i.pointer.primary_pressed())
                     && self.trim_drag.is_none()
                     && self.clip_move_drag.is_none()
+                    && self.marker_drag.is_none()
                 {
                     let proj_now = self.current_project();
                     if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
-                        if combined_rect.contains(pos) && tracks_rect.contains(pos) {
+                        if layout.gutter_contains(pos) {
+                            self.selected_track = layout.lane_at_y(pos.y);
+                            self.selected_clip_id = None;
+                            self.selected_marker = None;
+                        } else if let Some((slot, track, on_delete)) = timeline::marker_hit_at_pointer(
+                            &proj_now.markers,
+                            pos,
+                            &layout,
+                            view_left,
+                            pps,
+                            self.timeline_scroll_px,
+                        ) {
+                            self.selected_marker = Some((slot, track));
+                            self.selected_track = track;
+                            self.selected_clip_id = None;
+                            if on_delete {
+                                drop(proj_now);
+                                self.delete_selected_marker();
+                            } else {
+                                self.marker_drag = Some((slot, track));
+                            }
+                        } else if layout.marker_bar(layout.lane_at_y(pos.y)).contains(pos)
+                            && !layout.gutter_contains(pos)
+                        {
+                            self.selected_track = layout.lane_at_y(pos.y);
+                            self.selected_marker = None;
+                        } else if combined_rect.contains(pos)
+                            && layout.content_rect().contains(pos)
+                            && layout
+                                .clips_rect(layout.lane_at_y(pos.y))
+                                .contains(pos)
+                        {
                             let sel = self.selected_clip_id.filter(|id| proj_now.clip_index(*id).is_some());
                             if let Some(sel) = sel {
                                 if let Some(d) = timeline::trim_hit_test(
                                     &proj_now,
                                     sel,
                                     pos,
-                                    lanes_top,
-                                    lane_h,
+                                    &layout,
                                     view_left,
                                     pps,
                                     self.timeline_scroll_px,
@@ -620,14 +829,17 @@ impl eframe::App for TinySamplerApp {
                                 if let Some(id) = timeline::clip_id_at_pointer(
                                     &proj_now,
                                     pos,
-                                    lanes_top,
-                                    lane_h,
+                                    &layout,
                                     view_left,
                                     pps,
                                     self.timeline_scroll_px,
                                     proj_now.device_sample_rate,
                                 ) {
                                     self.selected_clip_id = Some(id);
+                                    self.selected_marker = None;
+                                    if let Some(i) = proj_now.clip_index(id) {
+                                        self.selected_track = proj_now.clips[i].track_index;
+                                    }
                                     let alt = ctx.input(|i| i.modifiers.alt);
                                     if alt {
                                         let mut p = (*proj_now).clone();
@@ -655,7 +867,11 @@ impl eframe::App for TinySamplerApp {
                 if pan_resp.dragged()
                     && self.trim_drag.is_none()
                     && self.clip_move_drag.is_none()
+                    && self.marker_drag.is_none()
                     && self.clip_settle_anim.is_none()
+                    && pan_resp
+                        .interact_pointer_pos()
+                        .is_none_or(|p| !layout.gutter_contains(p))
                 {
                     self.timeline_scroll_px =
                         (self.timeline_scroll_px - pan_resp.drag_delta().x).clamp(0.0, max_scroll);
@@ -663,6 +879,8 @@ impl eframe::App for TinySamplerApp {
                         self.follow_playhead_suspended = true;
                     }
                     ctx.set_cursor_icon(CursorIcon::Grabbing);
+                } else if self.marker_drag.is_some() {
+                    ctx.set_cursor_icon(CursorIcon::ResizeHorizontal);
                 } else if self.trim_drag.is_some() || self.clip_move_drag.is_some() {
                     let ghost_drag = self.clip_move_drag.is_some_and(|cid| {
                         proj.clip_index(cid)
@@ -678,12 +896,24 @@ impl eframe::App for TinySamplerApp {
                         CursorIcon::Grabbing
                     });
                 } else if let Some(hp) = ctx.pointer_hover_pos() {
-                    if timeline::pointer_near_trim_handle(
+                    if let Some((_, _, on_delete)) = timeline::marker_hit_at_pointer(
+                        &proj.markers,
+                        hp,
+                        &layout,
+                        view_left,
+                        pps,
+                        self.timeline_scroll_px,
+                    ) {
+                        ctx.set_cursor_icon(if on_delete {
+                            CursorIcon::PointingHand
+                        } else {
+                            CursorIcon::ResizeHorizontal
+                        });
+                    } else if timeline::pointer_near_trim_handle(
                         &proj,
                         self.selected_clip_id,
                         hp,
-                        lanes_top,
-                        lane_h,
+                        &layout,
                         view_left,
                         pps,
                         self.timeline_scroll_px,
@@ -694,8 +924,7 @@ impl eframe::App for TinySamplerApp {
                         &proj,
                         self.selected_clip_id,
                         hp,
-                        lanes_top,
-                        lane_h,
+                        &layout,
                         view_left,
                         pps,
                         self.timeline_scroll_px,
@@ -706,6 +935,8 @@ impl eframe::App for TinySamplerApp {
                         } else {
                             ctx.set_cursor_icon(CursorIcon::Move);
                         }
+                    } else if layout.gutter_contains(hp) {
+                        ctx.set_cursor_icon(CursorIcon::PointingHand);
                     } else if pan_resp.hovered() {
                         ctx.set_cursor_icon(CursorIcon::Grab);
                     }
@@ -717,19 +948,29 @@ impl eframe::App for TinySamplerApp {
                         if let Some(id) = timeline::clip_id_at_pointer(
                             &proj,
                             p,
-                            lanes_top,
-                            lane_h,
+                            &layout,
                             view_left,
                             pps,
                             sc,
                             proj.device_sample_rate,
                         ) {
                             self.selected_clip_id = Some(id);
+                            self.selected_marker = None;
+                            if let Some(i) = proj.clip_index(id) {
+                                self.selected_track = proj.clips[i].track_index;
+                            }
+                        } else if layout.gutter_contains(p) {
+                            self.selected_track = layout.lane_at_y(p.y);
+                            self.selected_clip_id = None;
+                            self.selected_marker = None;
                         } else {
                             self.selected_clip_id = None;
                             let time_at =
                                 |x: f32| -> f32 { (((x - view_left) + sc) / pps).max(0.0) };
-                            if ruler_rect.contains(p) || tracks_rect.contains(p) {
+                            if (ruler_rect.contains(p)
+                                || layout.content_rect().contains(p))
+                                && p.x >= view_left
+                            {
                                 let t = time_at(p.x);
                                 self.request_seek(t);
                                 self.timeline_scroll_px =
@@ -743,14 +984,14 @@ impl eframe::App for TinySamplerApp {
                 if proj.transport.is_playing {
                     if self.follow_playhead_suspended {
                         if timeline::playhead_in_viewport(
-                            tracks_rect,
+                            layout.content_rect(),
                             self.playhead_secs(),
                             pps,
                             self.timeline_scroll_px,
                         ) {
                             self.follow_playhead_suspended = false;
                             self.timeline_scroll_px = timeline::scroll_keep_playhead_in_view(
-                                tracks_rect,
+                                layout.content_rect(),
                                 self.playhead_secs(),
                                 pps,
                                 max_scroll,
@@ -759,7 +1000,7 @@ impl eframe::App for TinySamplerApp {
                         }
                     } else {
                         self.timeline_scroll_px = timeline::scroll_keep_playhead_in_view(
-                            tracks_rect,
+                            layout.content_rect(),
                             self.playhead_secs(),
                             pps,
                             max_scroll,
@@ -771,9 +1012,19 @@ impl eframe::App for TinySamplerApp {
                 let scroll = self.timeline_scroll_px;
                 let to_screen = |t: f32| -> f32 { view_left + t * pps - scroll };
 
+                let ruler_row_painter = ui.painter_at(ruler_row);
+                ruler_row_painter.rect_filled(ruler_gutter, 0.0, theme::color_track_gutter());
                 let ruler_painter = ui.painter_at(ruler_rect);
-                timeline::paint_time_ruler(&ruler_painter, ruler_rect, pps, scroll, ctx);
-                let play_x_head = view_left + self.playhead_secs() * pps - scroll;
+                timeline::paint_ruler(
+                    &ruler_painter,
+                    ruler_rect,
+                    pps,
+                    scroll,
+                    ctx,
+                    self.ruler_kind,
+                    self.current_project().tempo_bpm,
+                );
+                let play_x_head = to_screen(self.playhead_secs());
                 if play_x_head >= ruler_rect.left() && play_x_head <= ruler_rect.right() {
                     ruler_painter.line_segment(
                         [
@@ -786,22 +1037,36 @@ impl eframe::App for TinySamplerApp {
 
                 let painter = ui.painter_at(tracks_rect);
                 for lane in 0..n_lanes {
-                    let lane_rect = Rect::from_min_size(
-                        Pos2::new(tracks_rect.left(), lanes_top + lane as f32 * lane_h),
-                        Vec2::new(tracks_rect.width(), lane_h),
-                    );
+                    let clips = layout.clips_rect(lane);
                     let bg = if lane % 2 == 0 {
                         theme::color_timeline_bg()
                     } else {
                         theme::color_timeline_bg_alt()
                     };
-                    painter.rect_filled(lane_rect, 0.0, bg);
-                    painter.text(
-                        Pos2::new(lane_rect.left() + 6.0, lane_rect.top() + 4.0),
-                        egui::Align2::LEFT_TOP,
-                        format!("{}", lane + 1),
-                        egui::FontId::proportional(11.0),
-                        Color32::from_gray(140),
+                    painter.rect_filled(clips, 0.0, bg);
+                    if lane == self.selected_track {
+                        painter.rect_stroke(
+                            layout.block_rect(lane),
+                            0.0,
+                            Stroke::new(1.5_f32, theme::color_track_gutter_selected()),
+                        );
+                    }
+                    timeline::paint_track_gutter(
+                        &painter,
+                        layout.gutter_rect(lane),
+                        lane,
+                        lane == self.selected_track,
+                    );
+                    timeline::paint_marker_lane(
+                        &painter,
+                        &proj.markers,
+                        layout.marker_bar(lane),
+                        lane,
+                        view_left,
+                        pps,
+                        scroll,
+                        self.selected_marker,
+                        lane == self.selected_track,
                     );
                 }
                 painter.rect_stroke(
@@ -818,8 +1083,7 @@ impl eframe::App for TinySamplerApp {
                     let ghost = clip.placement_preview;
                     let clip_rect = timeline::clip_rect_on_timeline(
                         clip,
-                        lanes_top,
-                        lane_h,
+                        &layout,
                         view_left,
                         pps,
                         scroll,
@@ -836,7 +1100,7 @@ impl eframe::App for TinySamplerApp {
                     paint_waveform_overlay(
                         &painter,
                         clip_rect,
-                        tracks_rect,
+                        layout.clips_rect(clip.track_index),
                         &clip.sample.data,
                         &clip.sample.peaks,
                         clip.trim_start,
@@ -903,8 +1167,8 @@ impl eframe::App for TinySamplerApp {
                 }
 
                 if let Some(hp) = ui.ctx().pointer_hover_pos() {
-                    if combined_rect.contains(hp) {
-                        let gx = hp.x.clamp(combined_rect.left(), combined_rect.right());
+                    if combined_rect.contains(hp) && hp.x >= view_left {
+                        let gx = hp.x.clamp(view_left, combined_rect.right());
                         let cross_painter = ui.painter_at(combined_rect);
                         cross_painter.line_segment(
                             [
@@ -916,19 +1180,44 @@ impl eframe::App for TinySamplerApp {
                     }
                 }
 
-                let play_x = to_screen(self.playhead_secs());
-                painter.line_segment(
-                    [
-                        Pos2::new(play_x, tracks_rect.top()),
-                        Pos2::new(play_x, tracks_rect.bottom()),
-                    ],
-                    Stroke::new(2.0, theme::color_playhead()),
+                timeline::paint_markers(
+                    &painter,
+                    &proj.markers,
+                    &layout,
+                    view_left,
+                    pps,
+                    scroll,
                 );
+                for lane in 0..n_lanes {
+                    timeline::paint_marker_lane(
+                        &painter,
+                        &proj.markers,
+                        layout.marker_bar(lane),
+                        lane,
+                        view_left,
+                        pps,
+                        scroll,
+                        self.selected_marker,
+                        lane == self.selected_track,
+                    );
+                }
+
+                let play_x = to_screen(self.playhead_secs());
+                if play_x >= view_left && play_x <= tracks_rect.right() {
+                    painter.line_segment(
+                        [
+                            Pos2::new(play_x, tracks_rect.top()),
+                            Pos2::new(play_x, tracks_rect.bottom()),
+                        ],
+                        Stroke::new(2.0, theme::color_playhead()),
+                    );
+                }
 
                 if ctx.input(|i| i.pointer.primary_clicked()) {
                     if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
                         if !combined_rect.contains(pos) {
                             self.selected_clip_id = None;
+                            self.selected_marker = None;
                         }
                     }
                 }

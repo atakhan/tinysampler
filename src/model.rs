@@ -68,6 +68,14 @@ impl Default for Transport {
     }
 }
 
+/// Numbered cue on one track (keys `1`–`9` apply to the selected track).
+#[derive(Clone, Copy, Debug)]
+pub struct CueMarker {
+    pub slot: u8,
+    pub time_secs: f32,
+    pub track_index: usize,
+}
+
 #[derive(Clone)]
 pub struct Project {
     pub clips: Vec<Clip>,
@@ -75,6 +83,10 @@ pub struct Project {
     pub device_sample_rate: u32,
     /// Monotonic source for [`ClipId`] (not serialized yet).
     pub next_clip_id: u64,
+    /// Cue slots 1–9 (`M` to place, number keys to play from).
+    pub markers: Vec<CueMarker>,
+    /// Project tempo (BPM). Used by the tempo ruler; 4/4.
+    pub tempo_bpm: f32,
 }
 
 impl Project {
@@ -84,6 +96,8 @@ impl Project {
             transport: Transport::default(),
             device_sample_rate,
             next_clip_id: 1,
+            markers: Vec::new(),
+            tempo_bpm: 120.0,
         }
     }
 

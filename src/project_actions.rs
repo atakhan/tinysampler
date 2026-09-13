@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use crate::model::{Clip, ClipId, Project, Sample};
+use crate::model::{Clip, ClipId, CueMarker, Project, Sample};
 use crate::theme::MIN_TRIM_DURATION_SECS;
 use crate::timeline::{TrimDrag, TrimSide};
 use crate::wav_loader;
@@ -330,6 +330,60 @@ pub fn set_clip_track(project: &mut Project, clip_id: ClipId, track_index: usize
     true
 }
 
+pub const MARKER_SLOT_MAX: u8 = 9;
+
+/// Next free slot `1..=9`, or `None` if all digits are taken.
+pub fn try_place_marker(project: &mut Project, time_secs: f32, track_index: usize) -> Option<u8> {
+    let slot = (1u8..=MARKER_SLOT_MAX).find(|&s| {
+        !project
+            .markers
+            .iter()
+            .any(|m| m.track_index == track_index && m.slot == s)
+    })?;
+    let time_secs = time_secs.max(0.0);
+    if !time_secs.is_finite() {
+        return None;
+    }
+    project.markers.push(CueMarker {
+        slot,
+        time_secs,
+        track_index,
+    });
+    Some(slot)
+}
+
+pub fn marker_time(project: &Project, slot: u8, track_index: usize) -> Option<f32> {
+    project
+        .markers
+        .iter()
+        .find(|m| m.slot == slot && m.track_index == track_index)
+        .map(|m| m.time_secs)
+}
+
+pub fn move_marker(project: &mut Project, slot: u8, track_index: usize, time_secs: f32) -> bool {
+    let Some(m) = project
+        .markers
+        .iter_mut()
+        .find(|m| m.slot == slot && m.track_index == track_index)
+    else {
+        return false;
+    };
+    let t = time_secs.max(0.0);
+    if !t.is_finite() || (m.time_secs - t).abs() <= 1e-6 {
+        return false;
+    }
+    m.time_secs = t;
+    true
+}
+
+pub fn delete_marker(project: &mut Project, slot: u8, track_index: usize) -> bool {
+    let n = project.markers.len();
+    project
+        .markers
+        .retain(|m| !(m.slot == slot && m.track_index == track_index));
+    project.markers.len() != n
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,5 +405,22 @@ mod tests {
         assert_eq!(p.clips[1].track_index, 1);
         assert_eq!(p.clips[2].track_index, 2);
         assert_eq!(p.track_count(), 3);
+    }
+
+    #[test]
+    fn markers_fill_slots_1_to_9_then_stop() {
+        let mut p = Project::empty(48_000);
+        for i in 1u8..=9 {
+            assert_eq!(try_place_marker(&mut p, i as f32, 0), Some(i));
+        }
+        assert_eq!(try_place_marker(&mut p, 99.0, 0), None);
+        assert_eq!(try_place_marker(&mut p, 0.0, 1), Some(1));
+        assert_eq!(p.markers.len(), 10);
+        assert_eq!(marker_time(&p, 3, 0), Some(3.0));
+        assert!(move_marker(&mut p, 3, 0, 1.5));
+        assert_eq!(marker_time(&p, 3, 0), Some(1.5));
+        assert!(delete_marker(&mut p, 3, 0));
+        assert_eq!(marker_time(&p, 3, 0), None);
+        assert_eq!(try_place_marker(&mut p, 0.0, 0), Some(3));
     }
 }
