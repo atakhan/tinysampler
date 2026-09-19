@@ -41,6 +41,10 @@ pub const STUDIO_SIDEBAR_W: f32 = 200.0;
 pub const STUDIO_TRANSPORT_BTN: f32 = 36.0;
 pub const SAMPLER_MAP_H: f32 = 60.0;
 pub const SAMPLER_WAVE_H: f32 = 320.0;
+pub const SAMPLER_PAD_H: f32 = 48.0;
+pub const SAMPLER_PAD_GAP: f32 = 6.0;
+pub const SAMPLER_PAD_ROWS: usize = 2;
+pub const SAMPLER_PAD_COLS: usize = 8;
 
 pub fn color_transport_load() -> Color32 {
     Color32::from_rgb(64, 108, 168)
@@ -84,6 +88,10 @@ pub fn color_clip_zero_line() -> Color32 {
 
 pub fn color_playhead() -> Color32 {
     Color32::from_rgb(200, 80, 80)
+}
+
+pub fn color_sampler_base() -> Color32 {
+    Color32::from_rgb(220, 220, 236)
 }
 
 pub fn color_playhead_cross() -> Color32 {
@@ -136,4 +144,20 @@ pub fn color_sampler_viewport() -> Color32 {
 
 pub fn color_sampler_viewport_stroke() -> Color32 {
     Color32::from_rgba_unmultiplied(230, 240, 255, 180)
+}
+
+pub fn color_pad_empty() -> Color32 {
+    Color32::from_rgb(42, 42, 50)
+}
+
+pub fn color_pad_assigned() -> Color32 {
+    Color32::from_rgb(72, 92, 148)
+}
+
+pub fn color_pad_selected() -> Color32 {
+    Color32::from_rgb(96, 122, 186)
+}
+
+pub fn color_pad_held() -> Color32 {
+    Color32::from_rgb(52, 140, 92)
 }

@@ -41,6 +41,13 @@ pub struct Clip {
     pub placement_preview: bool,
 }
 
+/// Chop on the sampling-instrument waveform, bound to a pad slot `0..16`.
+#[derive(Clone, Copy, Debug)]
+pub struct PadMarker {
+    pub slot: u8,
+    pub sample_index: usize,
+}
+
 #[derive(Clone)]
 pub struct Track {
     pub name: String,
@@ -48,6 +55,8 @@ pub struct Track {
     pub pitch_semitones: i32,
     /// Tempo assigned in the sampling instrument (4/4 grid); 20–400 BPM.
     pub source_tempo_bpm: f32,
+    /// Sample chops in the instrument; slot `0` is top-left pad (Q).
+    pub pad_markers: Vec<PadMarker>,
 }
 
 impl Track {
@@ -59,9 +68,11 @@ impl Track {
 #[derive(Clone)]
 pub struct SamplerPreview {
     pub playing: bool,
-    /// Bumped to restart preview from the beginning.
+    /// Bumped to restart preview from [`Self::start_secs`].
     pub generation: u64,
     pub track_index: usize,
+    /// Wall-clock seconds into the sample when a generation bump restarts.
+    pub start_secs: f32,
 }
 
 impl Default for SamplerPreview {
@@ -70,6 +81,7 @@ impl Default for SamplerPreview {
             playing: false,
             generation: 0,
             track_index: 0,
+            start_secs: 0.0,
         }
     }
 }

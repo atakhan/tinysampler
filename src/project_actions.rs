@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use crate::model::{Clip, ClipId, CueMarker, Project, Sample, Track};
+use crate::model::{Clip, ClipId, CueMarker, PadMarker, Project, Sample, Track};
 use crate::theme::MIN_TRIM_DURATION_SECS;
 use crate::timeline::{TrimDrag, TrimSide};
 use crate::wav_loader;
@@ -13,11 +13,15 @@ pub fn add_track(project: &mut Project) -> usize {
         name: format!("Трек {}", i + 1),
         pitch_semitones: 0,
         source_tempo_bpm: project.tempo_bpm.clamp(20.0, 400.0),
+        pad_markers: Vec::new(),
     });
     i
 }
 
 pub fn set_track_sample(project: &mut Project, track_index: usize, sample: Sample, label: String) {
+    if let Some(track) = project.tracks.get_mut(track_index) {
+        track.pad_markers.clear();
+    }
     let n = sample.data.len();
     if let Some(clip) = project
         .clips
@@ -415,6 +419,100 @@ pub fn delete_marker(project: &mut Project, slot: u8, track_index: usize) -> boo
     project.markers.len() != n
 }
 
+pub const PAD_SLOT_COUNT: u8 = 16;
+
+pub fn try_place_pad_marker(
+    project: &mut Project,
+    track_index: usize,
+    sample_index: usize,
+    sample_len: usize,
+) -> Option<u8> {
+    if sample_len == 0 {
+        return None;
+    }
+    let idx = sample_index.min(sample_len - 1);
+    let track = project.tracks.get_mut(track_index)?;
+    let slot = (0u8..PAD_SLOT_COUNT).find(|&s| !track.pad_markers.iter().any(|m| m.slot == s))?;
+    track.pad_markers.push(PadMarker {
+        slot,
+        sample_index: idx,
+    });
+    Some(slot)
+}
+
+/// Bind `slot` to `sample_index` only if that pad is still empty.
+pub fn bind_pad_marker(
+    project: &mut Project,
+    track_index: usize,
+    slot: u8,
+    sample_index: usize,
+    sample_len: usize,
+) -> bool {
+    if sample_len == 0 || slot >= PAD_SLOT_COUNT {
+        return false;
+    }
+    let idx = sample_index.min(sample_len - 1);
+    let Some(track) = project.tracks.get_mut(track_index) else {
+        return false;
+    };
+    if track.pad_markers.iter().any(|m| m.slot == slot) {
+        return false;
+    }
+    track.pad_markers.push(PadMarker {
+        slot,
+        sample_index: idx,
+    });
+    true
+}
+
+pub fn pad_marker_sample(project: &Project, track_index: usize, slot: u8) -> Option<usize> {
+    project
+        .tracks
+        .get(track_index)?
+        .pad_markers
+        .iter()
+        .find(|m| m.slot == slot)
+        .map(|m| m.sample_index)
+}
+
+pub fn move_pad_marker(
+    project: &mut Project,
+    track_index: usize,
+    slot: u8,
+    sample_index: usize,
+    sample_len: usize,
+) -> bool {
+    if sample_len == 0 {
+        return false;
+    }
+    let idx = sample_index.min(sample_len - 1);
+    let Some(m) = project
+        .tracks
+        .get_mut(track_index)
+        .and_then(|t| t.pad_markers.iter_mut().find(|m| m.slot == slot))
+    else {
+        return false;
+    };
+    if m.sample_index == idx {
+        return false;
+    }
+    m.sample_index = idx;
+    true
+}
+
+pub fn delete_pad_marker(project: &mut Project, track_index: usize, slot: u8) -> bool {
+    let Some(track) = project.tracks.get_mut(track_index) else {
+        return false;
+    };
+    let n = track.pad_markers.len();
+    track.pad_markers.retain(|m| m.slot != slot);
+    track.pad_markers.len() != n
+}
+
+pub fn sample_index_to_preview_secs(sample_index: usize, sample_rate: u32, speed: f32) -> f32 {
+    sample_index as f32 / (sample_rate.max(1) as f32 * speed.max(0.05))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,5 +564,45 @@ mod tests {
         assert!(delete_marker(&mut p, 3, 0));
         assert_eq!(marker_time(&p, 3, 0), None);
         assert_eq!(try_place_marker(&mut p, 0.0, 0), Some(3));
+    }
+
+    #[test]
+    fn pad_markers_fill_16_slots_then_stop() {
+        let mut p = Project::empty(48_000);
+        let i = add_track(&mut p);
+        set_track_sample(&mut p, i, dummy_sample(), "a".into());
+        for s in 0u8..16 {
+            assert_eq!(try_place_pad_marker(&mut p, i, s as usize, 64), Some(s));
+        }
+        assert_eq!(try_place_pad_marker(&mut p, i, 99, 64), None);
+        assert_eq!(pad_marker_sample(&p, i, 3), Some(3));
+        assert!(move_pad_marker(&mut p, i, 3, 10, 64));
+        assert_eq!(pad_marker_sample(&p, i, 3), Some(10));
+        assert!(delete_pad_marker(&mut p, i, 3));
+        assert_eq!(pad_marker_sample(&p, i, 3), None);
+        assert_eq!(try_place_pad_marker(&mut p, i, 0, 64), Some(3));
+    }
+
+    #[test]
+    fn bind_pad_marker_keeps_slot_if_free() {
+        let mut p = Project::empty(48_000);
+        let i = add_track(&mut p);
+        set_track_sample(&mut p, i, dummy_sample(), "a".into());
+        assert!(bind_pad_marker(&mut p, i, 8, 12, 64));
+        assert_eq!(pad_marker_sample(&p, i, 8), Some(12));
+        assert!(!bind_pad_marker(&mut p, i, 8, 20, 64));
+        assert_eq!(pad_marker_sample(&p, i, 8), Some(12));
+        assert!(bind_pad_marker(&mut p, i, 0, 1, 64));
+        assert_eq!(pad_marker_sample(&p, i, 0), Some(1));
+    }
+
+    #[test]
+    fn replacing_sample_clears_pad_markers() {
+        let mut p = Project::empty(48_000);
+        let i = add_track(&mut p);
+        set_track_sample(&mut p, i, dummy_sample(), "a".into());
+        assert_eq!(try_place_pad_marker(&mut p, i, 4, 64), Some(0));
+        set_track_sample(&mut p, i, dummy_sample(), "b".into());
+        assert!(p.tracks[i].pad_markers.is_empty());
     }
 }

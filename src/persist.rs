@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Clip, ClipId, CueMarker, Project, Track};
+use crate::model::{Clip, ClipId, CueMarker, PadMarker, Project, Track};
 use crate::wav_loader;
 use crate::waveform::PeakPyramid;
 
@@ -54,6 +54,14 @@ struct TrackFile {
     name: String,
     pitch_semitones: i32,
     source_tempo_bpm: f32,
+    #[serde(default)]
+    pad_markers: Vec<PadMarkerFile>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PadMarkerFile {
+    slot: u8,
+    sample_index: usize,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -199,6 +207,14 @@ pub fn save_project(root: &Path, entry: &mut DiskProject) -> Result<(), String> 
                 name: t.name.clone(),
                 pitch_semitones: t.pitch_semitones,
                 source_tempo_bpm: t.source_tempo_bpm,
+                pad_markers: t
+                    .pad_markers
+                    .iter()
+                    .map(|m| PadMarkerFile {
+                        slot: m.slot,
+                        sample_index: m.sample_index,
+                    })
+                    .collect(),
             })
             .collect(),
         clips: entry
@@ -305,6 +321,45 @@ pub fn load_project(root: &Path, id: u64, device_sample_rate: u32) -> Result<Dis
         });
     }
 
+    let tracks: Vec<Track> = file
+        .tracks
+        .into_iter()
+        .enumerate()
+        .map(|(ti, t)| {
+            let n = clips
+                .iter()
+                .find(|c| c.track_index == ti)
+                .map(|c| c.sample.data.len())
+                .unwrap_or(0);
+            let max_i = n.saturating_sub(1);
+            let mut seen = [false; 16];
+            let pad_markers = if n == 0 {
+                Vec::new()
+            } else {
+                t.pad_markers
+                    .into_iter()
+                    .filter_map(|m| {
+                        let i = m.slot as usize;
+                        if i >= 16 || seen[i] {
+                            return None;
+                        }
+                        seen[i] = true;
+                        Some(PadMarker {
+                            slot: m.slot,
+                            sample_index: scale_index(m.sample_index, src_rate, dst_rate, max_i),
+                        })
+                    })
+                    .collect()
+            };
+            Track {
+                name: t.name,
+                pitch_semitones: t.pitch_semitones.clamp(-24, 24),
+                source_tempo_bpm: t.source_tempo_bpm.clamp(20.0, 400.0),
+                pad_markers,
+            }
+        })
+        .collect();
+
     let project = Project {
         name: file.name,
         clips,
@@ -320,15 +375,7 @@ pub fn load_project(root: &Path, id: u64, device_sample_rate: u32) -> Result<Dis
                 track_index: m.track_index,
             })
             .collect(),
-        tracks: file
-            .tracks
-            .into_iter()
-            .map(|t| Track {
-                name: t.name,
-                pitch_semitones: t.pitch_semitones.clamp(-24, 24),
-                source_tempo_bpm: t.source_tempo_bpm.clamp(20.0, 400.0),
-            })
-            .collect(),
+        tracks,
         tempo_bpm: file.tempo_bpm.clamp(20.0, 400.0),
         sampler_preview: crate::model::SamplerPreview::default(),
     };
@@ -434,6 +481,10 @@ mod tests {
         project_actions::set_track_sample(&mut project, t1, sample, "kick.wav".into());
         project.clips[1].start_time_secs = 1.5;
         project_actions::try_place_marker(&mut project, 0.5, 0);
+        assert_eq!(
+            project_actions::try_place_pad_marker(&mut project, t0, 7, 32),
+            Some(0)
+        );
 
         let mut entry = DiskProject::new(7, project);
         save_project(&root, &mut entry).unwrap();
@@ -459,6 +510,8 @@ mod tests {
         assert!((loaded.clips[0].sample.data[0] - 0.25).abs() < 1e-5);
         assert_eq!(loaded.clips[1].start_time_secs, 1.5);
         assert_eq!(loaded.markers.len(), 1);
+        assert_eq!(loaded.tracks[0].pad_markers.len(), 1);
+        assert_eq!(loaded.tracks[0].pad_markers[0].sample_index, 7);
 
         let _ = fs::remove_dir_all(&root);
     }

@@ -88,7 +88,10 @@ fn start_stream(
         playhead_secs = 0.0;
     }
     let mut last_stop_generation = project.load().transport.stop_generation;
-    let mut preview_secs = 0.0f32;
+    let mut preview_secs = f32::from_bits(preview_secs_bits.load(Ordering::Relaxed));
+    if !preview_secs.is_finite() {
+        preview_secs = 0.0;
+    }
     let mut last_preview_generation = project.load().sampler_preview.generation;
 
     let err_flag = Arc::clone(&stream_failed);
@@ -103,7 +106,10 @@ fn start_stream(
                     last_stop_generation = proj.transport.stop_generation;
                 }
                 if proj.sampler_preview.generation != last_preview_generation {
-                    preview_secs = 0.0;
+                    preview_secs = proj.sampler_preview.start_secs.max(0.0);
+                    if !preview_secs.is_finite() {
+                        preview_secs = 0.0;
+                    }
                     last_preview_generation = proj.sampler_preview.generation;
                 }
 
@@ -140,7 +146,11 @@ fn start_stream(
                         *o = 0.0;
                     }
                     playhead_secs_bits.store(playhead_secs.to_bits(), Ordering::Relaxed);
-                    preview_secs_bits.store(preview_secs.to_bits(), Ordering::Relaxed);
+                    // Sampler cursor is owned by the UI while preview is stopped.
+                    preview_secs = f32::from_bits(preview_secs_bits.load(Ordering::Relaxed));
+                    if !preview_secs.is_finite() {
+                        preview_secs = 0.0;
+                    }
                     return;
                 }
 
@@ -218,8 +228,12 @@ impl AudioEngine {
     }
 
     pub fn reset_preview_secs(&self) {
-        self.preview_secs_bits
-            .store(0.0f32.to_bits(), Ordering::Relaxed);
+        self.seek_preview_secs(0.0);
+    }
+
+    pub fn seek_preview_secs(&self, secs: f32) {
+        let secs = if secs.is_finite() { secs.max(0.0) } else { 0.0 };
+        self.preview_secs_bits.store(secs.to_bits(), Ordering::Relaxed);
     }
 
     /// Recreate the cpal stream when the default device changes or the old stream dies

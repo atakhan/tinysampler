@@ -63,6 +63,11 @@ pub struct TinySamplerApp {
     sampler_track: Option<usize>,
     sampler_view_start: f32,
     sampler_view_len: f32,
+    sampler_selected_pad: Option<u8>,
+    sampler_pad_drag: Option<u8>,
+    sampler_active_pad: Option<u8>,
+    /// Return-to point for the sampler playhead. Click on the waveform sets it.
+    sampler_base_secs: f32,
     persist_root: PathBuf,
     dirty: bool,
     last_persist: Instant,
@@ -127,6 +132,10 @@ impl TinySamplerApp {
             sampler_track: None,
             sampler_view_start: 0.0,
             sampler_view_len: 1.0,
+            sampler_selected_pad: None,
+            sampler_pad_drag: None,
+            sampler_active_pad: None,
+            sampler_base_secs: 0.0,
             persist_root,
             dirty: false,
             last_persist: Instant::now(),
@@ -376,6 +385,12 @@ impl TinySamplerApp {
                         .unwrap_or(1.0);
                     self.sampler_view_start = 0.0;
                     self.sampler_view_len = n.max(1.0);
+                    self.sampler_selected_pad = None;
+                    self.sampler_pad_drag = None;
+                    self.sampler_active_pad = None;
+                    self.sampler_base_secs = 0.0;
+                    p.sampler_preview.playing = false;
+                    self.engine.reset_preview_secs();
                     self.status = format!("{label} → {}", p.tracks[track].name);
                     self.publish(p);
                 } else {
@@ -439,12 +454,15 @@ impl TinySamplerApp {
             return;
         }
         if self.sampler_track.is_some() {
-            let (space, open_wav, escape, save) = ctx.input(|i| {
+            let (space, open_wav, escape, save, delete_pad, pad_slot) = ctx.input(|i| {
+                let mods = i.modifiers.ctrl || i.modifiers.command || i.modifiers.alt;
                 (
                     i.key_pressed(Key::Space) && !i.modifiers.ctrl,
                     i.key_pressed(Key::O) && (i.modifiers.ctrl || i.modifiers.command),
                     i.key_pressed(Key::Escape),
                     i.key_pressed(Key::S) && (i.modifiers.ctrl || i.modifiers.command),
+                    i.key_pressed(Key::Delete) && !mods,
+                    sampler::pad_slot_from_keys(i),
                 )
             });
             if escape {
@@ -455,6 +473,12 @@ impl TinySamplerApp {
                 self.try_pick_and_load_audio();
             } else if save {
                 self.persist_now(true);
+            } else if delete_pad {
+                if let Some(slot) = self.sampler_selected_pad {
+                    self.delete_sampler_pad(slot);
+                }
+            } else if let Some(slot) = pad_slot {
+                self.trigger_sampler_pad(slot);
             }
             return;
         }
@@ -612,7 +636,10 @@ impl TinySamplerApp {
         if self.screen != AppScreen::Studio || !self.dirty {
             return;
         }
-        if self.trim_drag.is_some() || self.clip_move_drag.is_some() || self.marker_drag.is_some()
+        if self.trim_drag.is_some()
+            || self.clip_move_drag.is_some()
+            || self.marker_drag.is_some()
+            || self.sampler_pad_drag.is_some()
         {
             return;
         }
@@ -648,6 +675,10 @@ impl TinySamplerApp {
         self.marker_drag = None;
         self.selected_track = 0;
         self.sampler_track = None;
+        self.sampler_selected_pad = None;
+        self.sampler_pad_drag = None;
+        self.sampler_active_pad = None;
+        self.sampler_base_secs = 0.0;
         self.status.clear();
         self.request_seek(0.0);
         self.playhead_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
@@ -720,9 +751,14 @@ impl TinySamplerApp {
         self.selected_track = track_index;
         self.sampler_view_start = 0.0;
         self.sampler_view_len = n.max(1.0);
+        self.sampler_selected_pad = None;
+        self.sampler_pad_drag = None;
+        self.sampler_active_pad = None;
+        self.sampler_base_secs = 0.0;
         let mut p = (*self.current_project()).clone();
         p.sampler_preview.playing = false;
         p.sampler_preview.track_index = track_index;
+        p.sampler_preview.start_secs = 0.0;
         self.publish(p);
         self.engine.reset_preview_secs();
     }
@@ -732,10 +768,20 @@ impl TinySamplerApp {
             return;
         }
         self.sampler_track = None;
+        self.sampler_selected_pad = None;
+        self.sampler_pad_drag = None;
+        self.sampler_active_pad = None;
+        self.sampler_base_secs = 0.0;
         let mut p = (*self.current_project()).clone();
         p.sampler_preview.playing = false;
+        p.sampler_preview.start_secs = 0.0;
         self.publish(p);
         self.engine.reset_preview_secs();
+    }
+
+    fn sampler_base_secs_clamped(&self) -> f32 {
+        let s = self.sampler_base_secs;
+        if s.is_finite() { s.max(0.0) } else { 0.0 }
     }
 
     fn sampler_toggle_preview(&mut self) {
@@ -745,14 +791,148 @@ impl TinySamplerApp {
         let mut p = (*self.current_project()).clone();
         if p.sampler_preview.playing {
             p.sampler_preview.playing = false;
+            self.sampler_active_pad = None;
+            self.publish(p);
+            self.engine.seek_preview_secs(self.sampler_base_secs_clamped());
         } else {
+            let start = self.sampler_base_secs_clamped();
             p.transport.is_playing = false;
             p.sampler_preview.playing = true;
+            p.sampler_preview.start_secs = start;
             p.sampler_preview.generation = p.sampler_preview.generation.wrapping_add(1);
             p.sampler_preview.track_index = track;
-            self.engine.reset_preview_secs();
+            self.sampler_active_pad = None;
+            self.engine.seek_preview_secs(start);
+            self.publish(p);
         }
+    }
+
+    fn start_sampler_preview_from(&mut self, start_secs: f32) {
+        let Some(track) = self.sampler_track else {
+            return;
+        };
+        let start_secs = if start_secs.is_finite() {
+            start_secs.max(0.0)
+        } else {
+            0.0
+        };
+        let mut p = (*self.current_project()).clone();
+        p.transport.is_playing = false;
+        p.sampler_preview.playing = true;
+        p.sampler_preview.start_secs = start_secs;
+        p.sampler_preview.generation = p.sampler_preview.generation.wrapping_add(1);
+        p.sampler_preview.track_index = track;
+        self.engine.seek_preview_secs(start_secs);
         self.publish(p);
+    }
+
+    fn sampler_sample_len(&self, track: usize) -> usize {
+        self.current_project()
+            .clips
+            .iter()
+            .find(|c| c.track_index == track)
+            .map(|c| c.sample.data.len())
+            .unwrap_or(0)
+    }
+
+    fn sampler_cursor_sample_index(&self, track: usize) -> Option<usize> {
+        let n = self.sampler_sample_len(track);
+        if n == 0 {
+            return None;
+        }
+        let p = self.current_project();
+        let speed = p.track_speed(track).max(0.05);
+        let rate = p.device_sample_rate.max(1) as f32;
+        let idx = (self.sampler_base_secs_clamped() * rate * speed).round() as usize;
+        Some(idx.min(n - 1))
+    }
+
+    fn seek_sampler_cursor(&mut self, sample_index: usize) {
+        let Some(track) = self.sampler_track else {
+            return;
+        };
+        let n = self.sampler_sample_len(track);
+        if n == 0 {
+            return;
+        }
+        let idx = sample_index.min(n - 1);
+        let p = self.current_project();
+        let secs = project_actions::sample_index_to_preview_secs(
+            idx,
+            p.device_sample_rate,
+            p.track_speed(track),
+        );
+        let playing = p.sampler_preview.playing;
+        drop(p);
+        self.sampler_base_secs = secs;
+        if !playing {
+            self.engine.seek_preview_secs(secs);
+        }
+    }
+
+    fn bind_sampler_pad_at_cursor(&mut self, slot: u8) {
+        let Some(track) = self.sampler_track else {
+            return;
+        };
+        if (slot as usize) >= sampler::PAD_COUNT {
+            return;
+        }
+        let Some(idx) = self.sampler_cursor_sample_index(track) else {
+            self.status = "Сначала загрузите сэмпл".into();
+            return;
+        };
+        let mut p = (*self.current_project()).clone();
+        let n = p
+            .clips
+            .iter()
+            .find(|c| c.track_index == track)
+            .map(|c| c.sample.data.len())
+            .unwrap_or(0);
+        if project_actions::bind_pad_marker(&mut p, track, slot, idx, n) {
+            self.sampler_selected_pad = Some(slot);
+            self.status = format!("Метка {}", sampler::PAD_LABELS[slot as usize]);
+            self.publish(p);
+        }
+    }
+
+    fn delete_sampler_pad(&mut self, slot: u8) {
+        let Some(track) = self.sampler_track else {
+            return;
+        };
+        let mut p = (*self.current_project()).clone();
+        if project_actions::delete_pad_marker(&mut p, track, slot) {
+            if self.sampler_selected_pad == Some(slot) {
+                self.sampler_selected_pad = None;
+            }
+            if self.sampler_active_pad == Some(slot) {
+                self.sampler_active_pad = None;
+            }
+            self.sampler_pad_drag = None;
+            self.publish(p);
+        }
+    }
+
+    fn trigger_sampler_pad(&mut self, slot: u8) {
+        let Some(track) = self.sampler_track else {
+            return;
+        };
+        if (slot as usize) >= sampler::PAD_COUNT {
+            return;
+        }
+        let p = self.current_project();
+        let Some(idx) = project_actions::pad_marker_sample(&p, track, slot) else {
+            drop(p);
+            self.bind_sampler_pad_at_cursor(slot);
+            return;
+        };
+        let rate = p.device_sample_rate;
+        let speed = p.track_speed(track);
+        drop(p);
+        let start = project_actions::sample_index_to_preview_secs(idx, rate, speed);
+        self.sampler_selected_pad = Some(slot);
+        self.sampler_active_pad = Some(slot);
+        self.status.clear();
+        self.start_sampler_preview_from(start);
     }
 
     fn sampler_nudge_pitch(&mut self, delta: i32) {
@@ -785,6 +965,33 @@ impl TinySamplerApp {
             sampler::SamplerAction::PitchDelta(d) => self.sampler_nudge_pitch(d),
             sampler::SamplerAction::TempoDelta(d) => self.sampler_nudge_tempo(d),
             sampler::SamplerAction::LoadFile => self.try_pick_and_load_audio(),
+            sampler::SamplerAction::SeekCursor { sample_index } => {
+                self.seek_sampler_cursor(sample_index);
+            }
+            sampler::SamplerAction::MovePad {
+                slot,
+                sample_index,
+            } => {
+                let Some(track) = self.sampler_track else {
+                    return;
+                };
+                let mut p = (*self.current_project()).clone();
+                let n = p
+                    .clips
+                    .iter()
+                    .find(|c| c.track_index == track)
+                    .map(|c| c.sample.data.len())
+                    .unwrap_or(0);
+                if project_actions::move_pad_marker(&mut p, track, slot, sample_index, n) {
+                    self.sampler_selected_pad = Some(slot);
+                    self.publish(p);
+                }
+            }
+            sampler::SamplerAction::DeletePad { slot } => self.delete_sampler_pad(slot),
+            sampler::SamplerAction::SelectPad { slot } => {
+                self.sampler_selected_pad = slot;
+            }
+            sampler::SamplerAction::TriggerPad { slot } => self.trigger_sampler_pad(slot),
         }
     }
 }
@@ -869,10 +1076,14 @@ impl TinySamplerApp {
         let speed = proj.tracks[track].playback_speed();
         let preview_playing = proj.sampler_preview.playing;
         let sample_rate = proj.device_sample_rate;
+        let pad_markers = proj.tracks[track].pad_markers.clone();
         let sample_buf = proj.clips.iter().find(|c| c.track_index == track).map(|c| {
             (Arc::clone(&c.sample.data), Arc::clone(&c.sample.peaks))
         });
         drop(proj);
+        if !preview_playing {
+            self.engine.seek_preview_secs(self.sampler_base_secs_clamped());
+        }
         let status = self.status.clone();
         let sample = sample_buf
             .as_ref()
@@ -884,15 +1095,20 @@ impl TinySamplerApp {
             sample,
             preview_playing,
             preview_secs: self.engine.preview_secs(),
+            base_secs: self.sampler_base_secs_clamped(),
             sample_rate,
             speed,
             status: &status,
+            pad_markers: &pad_markers,
+            selected_pad: self.sampler_selected_pad,
+            active_pad: self.sampler_active_pad,
         };
         let action = sampler::show(
             ctx,
             model,
             &mut self.sampler_view_start,
             &mut self.sampler_view_len,
+            &mut self.sampler_pad_drag,
         );
         if let Some(action) = action {
             self.apply_sampler_action(action);
@@ -901,10 +1117,20 @@ impl TinySamplerApp {
 
     fn show_studio(&mut self, ctx: &egui::Context) {
         let btn = theme::STUDIO_TRANSPORT_BTN;
+        let studio_locked = self.sampler_track.is_some();
+        if studio_locked {
+            self.trim_drag = None;
+            self.marker_drag = None;
+            if let Some(id) = self.clip_move_drag.take() {
+                self.clip_move_from_alt_duplicate = false;
+                self.finish_clip_preview_drop(ctx, id);
+            }
+        }
 
         egui::TopBottomPanel::top("studio_top")
             .exact_height(theme::STUDIO_TOP_BAR_H)
             .show(ctx, |ui| {
+                ui.add_enabled_ui(!studio_locked, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.add_space(8.0);
                     if ui
@@ -981,6 +1207,7 @@ impl TinySamplerApp {
                         ui.label(egui::RichText::new(name).weak().size(14.0));
                     });
                 });
+                });
             });
 
         if self.screen != AppScreen::Studio {
@@ -991,6 +1218,7 @@ impl TinySamplerApp {
             .exact_width(theme::STUDIO_SIDEBAR_W)
             .resizable(false)
             .show(ctx, |ui| {
+                ui.add_enabled_ui(!studio_locked, |ui| {
                 ui.add_space(8.0);
                 ui.label(egui::RichText::new("Треки").strong().size(15.0));
                 ui.add_space(6.0);
@@ -1041,6 +1269,7 @@ impl TinySamplerApp {
                 {
                     self.add_studio_track();
                 }
+                });
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -1157,11 +1386,16 @@ impl TinySamplerApp {
                 let pan_resp = ui.interact(
                     combined_rect,
                     egui::Id::new("timeline_scroll_pan"),
-                    egui::Sense::click_and_drag(),
+                    if studio_locked {
+                        egui::Sense::hover()
+                    } else {
+                        egui::Sense::click_and_drag()
+                    },
                 );
 
                 self.tick_clip_settle_anim(ctx);
 
+                if !studio_locked {
                 if let Some(drag) = self.trim_drag {
                     if ctx.input(|i| i.pointer.primary_down()) {
                         let dx = ctx.input(|i| i.pointer.delta().x);
@@ -1420,6 +1654,9 @@ impl TinySamplerApp {
                         }
                     }
                 }
+                }
+
+                let proj = self.current_project();
 
                 if proj.transport.is_playing {
                     if self.follow_playhead_suspended {
@@ -1599,7 +1836,8 @@ impl TinySamplerApp {
                     }
                 }
 
-                if let Some(hp) = ui.ctx().pointer_hover_pos() {
+                if !studio_locked {
+                    if let Some(hp) = ui.ctx().pointer_hover_pos() {
                     if combined_rect.contains(hp) && hp.x >= view_left {
                         let gx = hp.x.clamp(view_left, combined_rect.right());
                         let cross_painter = ui.painter_at(combined_rect);
@@ -1610,6 +1848,7 @@ impl TinySamplerApp {
                             ],
                             Stroke::new(1.5, theme::color_playhead_cross()),
                         );
+                    }
                     }
                 }
 
