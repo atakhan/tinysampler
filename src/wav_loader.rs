@@ -44,16 +44,16 @@ use crate::model::Sample;
 use crate::waveform;
 
 /// Load WAV or MP3 as mono f32 in [-1, 1]. Stereo → left channel only.
-/// Then resample to `target_rate` if needed (UI thread only).
-pub fn load_audio_mono_f32(path: &Path, target_rate: u32) -> Result<Sample, String> {
+/// Keeps the file's sample rate (document PCM is not tied to the output device).
+pub fn load_audio_mono_f32(path: &Path) -> Result<Sample, String> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
     match ext.as_str() {
-        "wav" => load_wav_mono_f32(path, target_rate),
-        "mp3" => load_mp3_mono_f32(path, target_rate),
+        "wav" => load_wav_mono_f32(path),
+        "mp3" => load_mp3_mono_f32(path),
         other => Err(format!(
             "unsupported audio format: .{other} (use WAV or MP3)"
         )),
@@ -61,8 +61,7 @@ pub fn load_audio_mono_f32(path: &Path, target_rate: u32) -> Result<Sample, Stri
 }
 
 /// Load WAV as mono f32 in [-1, 1]. Stereo → left channel only.
-/// Then resample to `target_rate` if needed (UI thread only).
-pub fn load_wav_mono_f32(path: &Path, target_rate: u32) -> Result<Sample, String> {
+pub fn load_wav_mono_f32(path: &Path) -> Result<Sample, String> {
     let mut reader = hound::WavReader::open(path).map_err(|e| e.to_string())?;
     let spec = reader.spec();
     let channels = spec.channels as usize;
@@ -71,12 +70,12 @@ pub fn load_wav_mono_f32(path: &Path, target_rate: u32) -> Result<Sample, String
     }
 
     let mono = read_mono_left(&mut reader, spec)?;
-    finalize_mono_sample(mono, spec.sample_rate, target_rate, "WAV")
+    finalize_mono_sample(mono, spec.sample_rate, "WAV")
 }
 
-fn load_mp3_mono_f32(path: &Path, target_rate: u32) -> Result<Sample, String> {
+fn load_mp3_mono_f32(path: &Path) -> Result<Sample, String> {
     let (mono, sample_rate) = decode_mp3_mono_f32(path)?;
-    finalize_mono_sample(mono, sample_rate, target_rate, "MP3")
+    finalize_mono_sample(mono, sample_rate, "MP3")
 }
 
 /// Write mono f32 PCM as a 32-bit float WAV (UI / persist thread only).
@@ -108,24 +107,16 @@ pub fn write_wav_f32_mono(path: &Path, data: &[f32], sample_rate: u32) -> Result
     Ok(())
 }
 
-fn finalize_mono_sample(
-    mono: Vec<f32>,
-    src_rate: u32,
-    target_rate: u32,
-    kind: &str,
-) -> Result<Sample, String> {
+fn finalize_mono_sample(mono: Vec<f32>, src_rate: u32, kind: &str) -> Result<Sample, String> {
     if mono.is_empty() {
         return Err(format!("{kind} has zero samples"));
     }
+    if src_rate == 0 {
+        return Err(format!("{kind} has unknown sample rate"));
+    }
 
-    let data = if src_rate == target_rate {
-        mono
-    } else {
-        resample_linear(&mono, src_rate, target_rate)
-    };
-
-    let peaks = waveform::PeakPyramid::build(&data);
-    Ok(Sample::new_mono(Arc::new(data), Arc::new(peaks)))
+    let peaks = waveform::PeakPyramid::build(&mono);
+    Ok(Sample::new_mono(Arc::new(mono), Arc::new(peaks), src_rate))
 }
 
 fn decode_mp3_mono_f32(path: &Path) -> Result<(Vec<f32>, u32), String> {
@@ -310,26 +301,4 @@ fn int_to_f32(v: i32, bits: u16) -> f32 {
     }
     let max = ((1i64 << (bits as i64 - 1)) - 1) as f32;
     (v as f32 / max).clamp(-1.0, 1.0)
-}
-
-fn resample_linear(src: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
-    if src.is_empty() || src_rate == 0 || dst_rate == 0 || src_rate == dst_rate {
-        return src.to_vec();
-    }
-    let ratio = src_rate as f64 / dst_rate as f64;
-    let out_len = ((src.len() as f64) / ratio).max(0.0) as usize;
-    let last = src.len() - 1;
-    let mut out = vec![0.0f32; out_len];
-    for (i, dst) in out.iter_mut().enumerate() {
-        let src_pos = i as f64 * ratio;
-        let j = src_pos as usize;
-        if j >= last {
-            *dst = src[last];
-            continue;
-        }
-        let frac = (src_pos - j as f64) as f32;
-        let a = src[j];
-        *dst = a + (src[j + 1] - a) * frac;
-    }
-    out
 }

@@ -4,22 +4,8 @@
 
 use egui::{Color32, Context, FontId, Painter, Pos2, Rect, RichText, Stroke, Vec2};
 
-use crate::model::{Clip, ClipId, CueMarker, Project};
-use crate::theme::{
-    self, TRIM_HANDLE_WIDTH_PX,
-};
-
-#[derive(Clone, Copy)]
-pub enum TrimSide {
-    Left,
-    Right,
-}
-
-#[derive(Clone, Copy)]
-pub struct TrimDrag {
-    pub clip_id: ClipId,
-    pub side: TrimSide,
-}
+use crate::model::{CueMarker, Project, TrackId};
+use crate::theme;
 
 /// Major tick spacing in seconds for the time ruler (~constant label width on screen).
 pub fn time_ruler_step_secs(pps: f32) -> f32 {
@@ -102,127 +88,8 @@ impl TrackLayout {
     }
 }
 
-pub fn clip_rect_on_timeline(
-    clip: &Clip,
-    layout: &TrackLayout,
-    view_left: f32,
-    pps: f32,
-    scroll: f32,
-    duration_secs: f32,
-) -> Rect {
-    let x0 = view_left + clip.start_time_secs * pps - scroll;
-    let w = duration_secs * pps;
-    let pad = 8.0_f32;
-    let clips = layout.clips_rect(clip.track_index);
-    Rect::from_min_size(
-        Pos2::new(x0, clips.top() + pad),
-        Vec2::new(w.max(8.0), (clips.height() - pad * 2.0).max(4.0)),
-    )
-}
-
 pub fn track_index_at_y(y: f32, layout: &TrackLayout) -> usize {
     layout.lane_at_y(y)
-}
-
-pub fn trim_hit_test(
-    proj: &Project,
-    selected_id: ClipId,
-    pos: Pos2,
-    layout: &TrackLayout,
-    view_left: f32,
-    pps: f32,
-    scroll: f32,
-) -> Option<TrimDrag> {
-    let i = proj.clip_index(selected_id)?;
-    let dur = proj.clip_sounding_secs_at(i);
-    let clip = &proj.clips[i];
-    let cr = clip_rect_on_timeline(clip, layout, view_left, pps, scroll, dur);
-    let hw = TRIM_HANDLE_WIDTH_PX.min(cr.width() * 0.5);
-    let left_h = Rect::from_min_size(cr.min, Vec2::new(hw, cr.height()));
-    let right_h = Rect::from_min_max(Pos2::new(cr.right() - hw, cr.top()), cr.max);
-    if left_h.contains(pos) {
-        return Some(TrimDrag {
-            clip_id: clip.id,
-            side: TrimSide::Left,
-        });
-    }
-    if right_h.contains(pos) {
-        return Some(TrimDrag {
-            clip_id: clip.id,
-            side: TrimSide::Right,
-        });
-    }
-    None
-}
-
-pub fn pointer_near_trim_handle(
-    proj: &Project,
-    selected: Option<ClipId>,
-    pos: Pos2,
-    layout: &TrackLayout,
-    view_left: f32,
-    pps: f32,
-    scroll: f32,
-) -> bool {
-    let Some(sid) = selected else {
-        return false;
-    };
-    trim_hit_test(proj, sid, pos, layout, view_left, pps, scroll).is_some()
-}
-
-/// Selected clip body (full rect minus trim handles) — for move hover / drag start.
-pub fn pointer_on_selected_clip_move_body(
-    proj: &Project,
-    selected: Option<ClipId>,
-    pos: Pos2,
-    layout: &TrackLayout,
-    view_left: f32,
-    pps: f32,
-    scroll: f32,
-) -> bool {
-    let Some(sid) = selected else {
-        return false;
-    };
-    if trim_hit_test(proj, sid, pos, layout, view_left, pps, scroll).is_some() {
-        return false;
-    }
-    let Some(i) = proj.clip_index(sid) else {
-        return false;
-    };
-    let dur = proj.clip_sounding_secs_at(i);
-    let clip = &proj.clips[i];
-    let cr = clip_rect_on_timeline(clip, layout, view_left, pps, scroll, dur);
-    cr.contains(pos)
-}
-
-pub fn clip_index_at_pointer(
-    proj: &Project,
-    p: Pos2,
-    layout: &TrackLayout,
-    view_left: f32,
-    pps: f32,
-    scroll: f32,
-) -> Option<usize> {
-    let mut order: Vec<usize> = (0..proj.clips.len()).collect();
-    order.sort_by_key(|&i| !proj.clips[i].placement_preview);
-    order.into_iter().find_map(|i| {
-        let dur = proj.clip_sounding_secs_at(i);
-        let clip = &proj.clips[i];
-        let r = clip_rect_on_timeline(clip, layout, view_left, pps, scroll, dur);
-        r.contains(p).then_some(i)
-    })
-}
-
-pub fn clip_id_at_pointer(
-    proj: &Project,
-    p: Pos2,
-    layout: &TrackLayout,
-    view_left: f32,
-    pps: f32,
-    scroll: f32,
-) -> Option<ClipId> {
-    let i = clip_index_at_pointer(proj, p, layout, view_left, pps, scroll)?;
-    Some(proj.clips[i].id)
 }
 
 fn format_ruler_time(secs: f32, step: f32) -> String {
@@ -268,11 +135,7 @@ pub enum RulerKind {
     Tempo,
 }
 
-pub const BEATS_PER_BAR: f32 = 4.0;
-
-pub fn beat_secs(bpm: f32) -> f32 {
-    60.0 / bpm.clamp(20.0, 400.0)
-}
+pub use crate::time::{beat_secs, BEATS_PER_BAR};
 
 /// Major/minor spacing in seconds for a 4/4 tempo ruler.
 fn tempo_ruler_steps(pps: f32, bpm: f32) -> (f32, Option<f32>) {
@@ -489,7 +352,7 @@ pub fn paint_tempo_ruler(
 
 pub fn paint_markers(
     painter: &Painter,
-    markers: &[CueMarker],
+    project: &Project,
     layout: &TrackLayout,
     view_left: f32,
     pps: f32,
@@ -499,11 +362,14 @@ pub fn paint_markers(
         return;
     }
     let col = theme::color_marker();
-    for m in markers {
+    for m in &project.markers {
         if !(1..=9).contains(&m.slot) || !m.time_secs.is_finite() {
             continue;
         }
-        let clips = layout.clips_rect(m.track_index);
+        let Some(lane) = project.track_index(m.track_id) else {
+            continue;
+        };
+        let clips = layout.clips_rect(lane);
         let x = view_left + m.time_secs * pps - scroll;
         if x < clips.left() - 8.0 || x > clips.right() + 8.0 {
             continue;
@@ -535,23 +401,26 @@ fn marker_delete_rect(chip: Rect) -> Rect {
     )
 }
 
-/// `(slot, track, hit_delete)`.
+/// `(slot, track_id, hit_delete)`.
 pub fn marker_hit_at_pointer(
-    markers: &[CueMarker],
+    project: &Project,
     pos: Pos2,
     layout: &TrackLayout,
     view_left: f32,
     pps: f32,
     scroll: f32,
-) -> Option<(u8, usize, bool)> {
+) -> Option<(u8, TrackId, bool)> {
     let lane = layout.lane_at_y(pos.y);
     let bar = layout.marker_bar(lane);
     if !bar.contains(pos) {
         return None;
     }
-    let mut hits: Vec<(u8, usize, bool, f32)> = Vec::new();
-    for m in markers {
-        if m.track_index != lane || !(1..=9).contains(&m.slot) {
+    let Some(track_id) = project.track_id_at_lane(lane) else {
+        return None;
+    };
+    let mut hits: Vec<(u8, TrackId, bool, f32)> = Vec::new();
+    for m in &project.markers {
+        if m.track_id != track_id || !(1..=9).contains(&m.slot) {
             continue;
         }
         let chip = marker_chip_rect(m.time_secs, bar, view_left, pps, scroll);
@@ -559,7 +428,7 @@ pub fn marker_hit_at_pointer(
             continue;
         }
         let on_delete = marker_delete_rect(chip).contains(pos);
-        hits.push((m.slot, lane, on_delete, (chip.center().x - pos.x).abs()));
+        hits.push((m.slot, track_id, on_delete, (chip.center().x - pos.x).abs()));
     }
     hits.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal));
     hits.first().map(|&(slot, track, del, _)| (slot, track, del))
@@ -569,11 +438,11 @@ pub fn paint_marker_lane(
     painter: &Painter,
     markers: &[CueMarker],
     bar: Rect,
-    track_index: usize,
+    track_id: TrackId,
     view_left: f32,
     pps: f32,
     scroll: f32,
-    selected: Option<(u8, usize)>,
+    selected: Option<(u8, TrackId)>,
     track_selected: bool,
 ) {
     painter.rect_filled(bar, 0.0, theme::color_marker_lane_bg());
@@ -586,7 +455,7 @@ pub fn paint_marker_lane(
     );
     let on_track: Vec<&CueMarker> = markers
         .iter()
-        .filter(|m| m.track_index == track_index)
+        .filter(|m| m.track_id == track_id)
         .collect();
     if on_track.is_empty() {
         if track_selected {
@@ -612,7 +481,7 @@ pub fn paint_marker_lane(
         if chip.right() < bar.left() - 2.0 || chip.left() > bar.right() + 2.0 {
             continue;
         }
-        let selected = selected == Some((m.slot, track_index));
+        let selected = selected == Some((m.slot, track_id));
         painter.rect_filled(chip, 3.0, col);
         if selected {
             painter.rect_stroke(chip, 3.0, Stroke::new(1.5_f32, Color32::WHITE));

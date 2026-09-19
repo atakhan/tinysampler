@@ -182,24 +182,14 @@ fn start_stream(
     Ok((stream, sample_rate, device_name))
 }
 
-/// One default-output probe: builds [`Project`] at the device rate, starts the stream, returns handles.
-pub fn open_output<F>(
-    make_project: F,
+/// Starts the default-output stream. Document PCM keeps its own sample rate;
+/// the stream rate only advances wall-clock time in the callback.
+pub fn open_output(
     playhead_secs_bits: Arc<AtomicU32>,
     seek_pending: Arc<AtomicBool>,
     seek_target_secs_bits: Arc<AtomicU32>,
-) -> Result<(AudioEngine, Arc<ArcSwap<Project>>), String>
-where
-    F: FnOnce(u32) -> Project,
-{
-    let host = cpal::default_host();
-    let device = host
-        .default_output_device()
-        .ok_or_else(|| "no default output device".to_string())?;
-    let config = device.default_output_config().map_err(|e| e.to_string())?;
-    let sample_rate = config.sample_rate().0;
-
-    let project = Arc::new(ArcSwap::from_pointee(make_project(sample_rate)));
+) -> Result<(AudioEngine, Arc<ArcSwap<Project>>), String> {
+    let project = Arc::new(ArcSwap::from_pointee(Project::empty()));
     let stream_failed = Arc::new(AtomicBool::new(false));
     let preview_secs_bits = Arc::new(AtomicU32::new(0.0f32.to_bits()));
     let (stream, out_rate, device_name) = start_stream(

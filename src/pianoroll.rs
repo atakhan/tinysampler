@@ -53,6 +53,7 @@ pub enum PianoRollAction {
 
 pub fn seq_rect(
     seq: &SeqClip,
+    lane: usize,
     layout: &TrackLayout,
     view_left: f32,
     pps: f32,
@@ -61,7 +62,7 @@ pub fn seq_rect(
     let x0 = view_left + seq.start_time_secs * pps - scroll;
     let w = (seq.duration_secs * pps).max(8.0);
     let pad = 8.0_f32;
-    let clips = layout.clips_rect(seq.track_index);
+    let clips = layout.clips_rect(lane);
     Rect::from_min_size(
         Pos2::new(x0, clips.top() + pad),
         Vec2::new(w, (clips.height() - pad * 2.0).max(4.0)),
@@ -78,11 +79,14 @@ pub fn hit_seq(
 ) -> Option<(SeqId, SeqHit)> {
     let mut best: Option<(SeqId, SeqHit, f32)> = None;
     for seq in &project.seq_clips {
-        let clips = layout.clips_rect(seq.track_index);
+        let Some(lane) = project.track_index(seq.track_id) else {
+            continue;
+        };
+        let clips = layout.clips_rect(lane);
         if !clips.contains(pos) {
             continue;
         }
-        let r = seq_rect(seq, layout, view_left, pps, scroll);
+        let r = seq_rect(seq, lane, layout, view_left, pps, scroll);
         if !r.contains(pos) {
             continue;
         }
@@ -112,8 +116,11 @@ pub fn paint_sausages(
     selected: Option<SeqId>,
 ) {
     for seq in &project.seq_clips {
-        let r = seq_rect(seq, layout, view_left, pps, scroll);
-        let clips = layout.clips_rect(seq.track_index);
+        let Some(lane) = project.track_index(seq.track_id) else {
+            continue;
+        };
+        let r = seq_rect(seq, lane, layout, view_left, pps, scroll);
+        let clips = layout.clips_rect(lane);
         if r.right() < clips.left() || r.left() > clips.right() {
             continue;
         }

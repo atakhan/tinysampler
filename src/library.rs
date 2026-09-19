@@ -2,13 +2,8 @@
 
 use egui::{Color32, RichText, Sense, Vec2};
 
+use crate::persist::LibraryMeta;
 use crate::theme;
-
-pub struct LibraryItem {
-    pub id: u64,
-    pub name: String,
-    pub track_count: usize,
-}
 
 pub enum LibraryAction {
     Create,
@@ -17,7 +12,7 @@ pub enum LibraryAction {
 
 pub fn show(
     ctx: &egui::Context,
-    items: &[LibraryItem],
+    items: &[LibraryMeta],
     data_dir: &str,
     status: &str,
 ) -> Option<LibraryAction> {

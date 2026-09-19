@@ -1,4 +1,9 @@
 //! On-disk projects: JSON metadata + unique mono WAV samples.
+//!
+//! Saves go through `p{id}.next` then a directory publish so a crash cannot
+//! leave `project.json` pointing at deleted WAVs. Load prefers `p{id}`, then
+//! `.next`, then `.bak`. A missing WAV becomes an empty track buffer, not a
+//! failed project.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -6,30 +11,25 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Clip, ClipId, CueMarker, NoteId, PadMarker, PadNote, Project, SeqClip, SeqId, Track};
+use crate::model::{
+    CueMarker, NoteId, PadMarker, PadNote, Project, Sample, SeqClip, SeqId, Track, TrackId,
+};
 use crate::project_actions::{pad_default_len, pad_range_from_start};
 use crate::wav_loader;
 use crate::waveform::PeakPyramid;
 
 const FORMAT: u32 = 1;
 
-#[derive(Clone)]
-pub struct DiskProject {
+/// Library card: no PCM. Full documents load on Open.
+#[derive(Clone, Debug)]
+pub struct LibraryMeta {
     pub id: u64,
-    pub project: Project,
-    /// `Arc` pointer of PCM → filename inside `samples/`, so we do not rewrite unchanged buffers.
-    sample_files: HashMap<usize, String>,
+    pub name: String,
+    pub track_count: usize,
 }
 
-impl DiskProject {
-    pub fn new(id: u64, project: Project) -> Self {
-        Self {
-            id,
-            project,
-            sample_files: HashMap::new(),
-        }
-    }
-}
+/// Pointer identity of a live `Arc<Vec<f32>>` → filename in `samples/`.
+pub type SampleFileMap = HashMap<usize, String>;
 
 #[derive(Serialize, Deserialize)]
 struct LibraryFile {
@@ -42,10 +42,9 @@ struct ProjectFile {
     format: u32,
     id: u64,
     name: String,
-    pcm_sample_rate: u32,
     tempo_bpm: f32,
-    next_clip_id: u64,
     tracks: Vec<TrackFile>,
+    #[serde(default)]
     clips: Vec<ClipFile>,
     markers: Vec<MarkerFile>,
     #[serde(default)]
@@ -56,15 +55,27 @@ struct ProjectFile {
     next_note_id: u64,
     #[serde(default)]
     next_seq_id: u64,
+    #[serde(default)]
+    next_track_id: u64,
+    /// Legacy: PCM used to be stored at the output device rate.
+    #[serde(default)]
+    pcm_sample_rate: u32,
 }
 
 #[derive(Serialize, Deserialize)]
 struct TrackFile {
+    #[serde(default)]
+    id: u64,
     name: String,
     pitch_semitones: i32,
+    #[serde(default)]
     source_tempo_bpm: f32,
     #[serde(default)]
     pad_markers: Vec<PadMarkerFile>,
+    #[serde(default)]
+    sample: Option<String>,
+    #[serde(default)]
+    sample_label: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -80,10 +91,15 @@ struct PadMarkerFile {
 
 #[derive(Serialize, Deserialize)]
 struct ClipFile {
+    #[serde(default)]
     id: u64,
+    #[serde(default)]
     start_time_secs: f32,
+    #[serde(default)]
     label: String,
+    #[serde(default)]
     trim_start: usize,
+    #[serde(default)]
     trim_end: usize,
     track_index: usize,
     #[serde(default)]
@@ -94,7 +110,10 @@ struct ClipFile {
 struct MarkerFile {
     slot: u8,
     time_secs: f32,
-    track_index: usize,
+    #[serde(default)]
+    track_id: Option<u64>,
+    #[serde(default)]
+    track_index: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -112,7 +131,10 @@ struct NoteFile {
 #[derive(Serialize, Deserialize)]
 struct SeqClipFile {
     id: u64,
-    track_index: usize,
+    #[serde(default)]
+    track_id: Option<u64>,
+    #[serde(default)]
+    track_index: Option<usize>,
     start_time_secs: f32,
     duration_secs: f32,
 }
@@ -145,21 +167,49 @@ fn project_dir(root: &Path, id: u64) -> PathBuf {
     projects_dir(root).join(format!("p{id}"))
 }
 
+fn project_next_dir(root: &Path, id: u64) -> PathBuf {
+    projects_dir(root).join(format!("p{id}.next"))
+}
+
+fn project_bak_dir(root: &Path, id: u64) -> PathBuf {
+    projects_dir(root).join(format!("p{id}.bak"))
+}
+
 fn index_path(root: &Path) -> PathBuf {
     root.join("library.json")
 }
 
-fn write_json_atomic(path: &Path, body: &str) -> Result<(), String> {
+fn write_bytes_replace(path: &Path, body: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, body).map_err(|e| e.to_string())?;
+    let new_path = sidecar(path, "new");
+    let bak_path = sidecar(path, "bak");
+    fs::write(&new_path, body).map_err(|e| e.to_string())?;
     if path.exists() {
-        fs::remove_file(path).map_err(|e| e.to_string())?;
+        let _ = fs::remove_file(&bak_path);
+        fs::rename(path, &bak_path).map_err(|e| e.to_string())?;
     }
-    fs::rename(&tmp, path).map_err(|e| e.to_string())?;
-    Ok(())
+    match fs::rename(&new_path, path) {
+        Ok(()) => {
+            let _ = fs::remove_file(&bak_path);
+            Ok(())
+        }
+        Err(e) => {
+            if bak_path.exists() && !path.exists() {
+                let _ = fs::rename(&bak_path, path);
+            }
+            Err(e.to_string())
+        }
+    }
+}
+
+fn sidecar(path: &Path, kind: &str) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file");
+    path.with_file_name(format!("{name}.{kind}"))
 }
 
 pub fn save_index(root: &Path, next_project_id: u64) -> Result<(), String> {
@@ -169,80 +219,110 @@ pub fn save_index(root: &Path, next_project_id: u64) -> Result<(), String> {
         next_project_id,
     };
     let body = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
-    write_json_atomic(&index_path(root), &body)
+    write_bytes_replace(&index_path(root), &body)
 }
 
-pub fn save_project(root: &Path, entry: &mut DiskProject) -> Result<(), String> {
+fn load_index_file(root: &Path) -> Option<LibraryFile> {
+    let primary = index_path(root);
+    let bak = sidecar(&primary, "bak");
+    for path in [&primary, &bak] {
+        let Ok(raw) = fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(idx) = serde_json::from_str::<LibraryFile>(&raw) else {
+            continue;
+        };
+        if idx.format == FORMAT {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+/// Directory that actually contains `project.json` for `id` (published, next, or bak).
+pub fn resolve_project_dir(root: &Path, id: u64) -> Option<PathBuf> {
+    for dir in [
+        project_dir(root, id),
+        project_next_dir(root, id),
+        project_bak_dir(root, id),
+    ] {
+        if dir.join("project.json").is_file() {
+            return Some(dir);
+        }
+    }
+    None
+}
+
+pub fn save_project(
+    root: &Path,
+    id: u64,
+    project: &Project,
+    sample_files: &mut SampleFileMap,
+) -> Result<(), String> {
     ensure_root(root)?;
-    let dir = project_dir(root, entry.id);
-    let samples_dir = dir.join("samples");
-    fs::create_dir_all(&samples_dir).map_err(|e| e.to_string())?;
+    let dest = project_dir(root, id);
+    let next = project_next_dir(root, id);
+    let bak = project_bak_dir(root, id);
+    let _ = fs::remove_dir_all(&next);
+    let samples_next = next.join("samples");
+    fs::create_dir_all(&samples_next).map_err(|e| e.to_string())?;
 
-    let pcm_rate = entry.project.device_sample_rate.max(1);
+    let dest_samples = dest.join("samples");
     let mut used_names: HashSet<String> = HashSet::new();
-    let mut ptr_to_file: HashMap<usize, String> = HashMap::new();
-    let mut clip_files: Vec<Option<String>> = Vec::with_capacity(entry.project.clips.len());
+    let mut ptr_to_file: SampleFileMap = HashMap::new();
+    let mut track_sample_names: Vec<Option<String>> = Vec::with_capacity(project.tracks.len());
 
-    for clip in &entry.project.clips {
-        if clip.sample.data.is_empty() {
-            clip_files.push(None);
+    for track in &project.tracks {
+        let Some(sample) = track.sample.as_ref() else {
+            track_sample_names.push(None);
+            continue;
+        };
+        if sample.data.is_empty() {
+            track_sample_names.push(None);
             continue;
         }
-        let ptr = std::sync::Arc::as_ptr(&clip.sample.data) as usize;
+        let ptr = std::sync::Arc::as_ptr(&sample.data) as usize;
         if let Some(name) = ptr_to_file.get(&ptr) {
             used_names.insert(name.clone());
-            clip_files.push(Some(name.clone()));
+            track_sample_names.push(Some(name.clone()));
             continue;
         }
-        if let Some(existing) = entry.sample_files.get(&ptr) {
-            let path = samples_dir.join(existing);
-            if path.is_file() {
+        if let Some(existing) = sample_files.get(&ptr) {
+            let src = dest_samples.join(existing);
+            if src.is_file() {
+                fs::copy(&src, samples_next.join(existing)).map_err(|e| e.to_string())?;
                 used_names.insert(existing.clone());
                 ptr_to_file.insert(ptr, existing.clone());
-                clip_files.push(Some(existing.clone()));
+                track_sample_names.push(Some(existing.clone()));
                 continue;
             }
         }
-        let name = next_sample_name(&samples_dir, &used_names);
-        let path = samples_dir.join(&name);
-        wav_loader::write_wav_f32_mono(&path, &clip.sample.data, pcm_rate)?;
+        let name = next_sample_name(&samples_next, &used_names);
+        let path = samples_next.join(&name);
+        wav_loader::write_wav_f32_mono(&path, &sample.data, sample.rate())?;
         used_names.insert(name.clone());
         ptr_to_file.insert(ptr, name.clone());
-        clip_files.push(Some(name));
-    }
-
-    entry.sample_files = ptr_to_file;
-
-    if samples_dir.is_dir() {
-        for ent in fs::read_dir(&samples_dir).map_err(|e| e.to_string())? {
-            let ent = ent.map_err(|e| e.to_string())?;
-            let path = ent.path();
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if name.ends_with(".wav") && !used_names.contains(name) {
-                let _ = fs::remove_file(&path);
-            }
-        }
+        track_sample_names.push(Some(name));
     }
 
     let file = ProjectFile {
         format: FORMAT,
-        id: entry.id,
-        name: entry.project.name.clone(),
-        pcm_sample_rate: pcm_rate,
-        tempo_bpm: entry.project.tempo_bpm,
-        next_clip_id: entry.project.next_clip_id,
-        next_note_id: entry.project.next_note_id,
-        next_seq_id: entry.project.next_seq_id,
-        tracks: entry
-            .project
+        id,
+        name: project.name.clone(),
+        tempo_bpm: project.tempo_bpm,
+        pcm_sample_rate: 0,
+        next_note_id: project.next_note_id,
+        next_seq_id: project.next_seq_id,
+        next_track_id: project.next_track_id,
+        tracks: project
             .tracks
             .iter()
-            .map(|t| TrackFile {
+            .zip(track_sample_names)
+            .map(|(t, sample)| TrackFile {
+                id: t.id.0,
                 name: t.name.clone(),
                 pitch_semitones: t.pitch_semitones,
-                source_tempo_bpm: t.source_tempo_bpm,
+                source_tempo_bpm: project.tempo_bpm,
                 pad_markers: t
                     .pad_markers
                     .iter()
@@ -253,35 +333,22 @@ pub fn save_project(root: &Path, entry: &mut DiskProject) -> Result<(), String> 
                         end_index: Some(m.end_index),
                     })
                     .collect(),
-            })
-            .collect(),
-        clips: entry
-            .project
-            .clips
-            .iter()
-            .zip(clip_files)
-            .map(|(c, sample)| ClipFile {
-                id: c.id.0,
-                start_time_secs: c.start_time_secs,
-                label: c.label.clone(),
-                trim_start: c.trim_start,
-                trim_end: c.trim_end,
-                track_index: c.track_index,
                 sample,
+                sample_label: t.sample_label.clone(),
             })
             .collect(),
-        markers: entry
-            .project
+        clips: Vec::new(),
+        markers: project
             .markers
             .iter()
             .map(|m| MarkerFile {
                 slot: m.slot,
                 time_secs: m.time_secs,
-                track_index: m.track_index,
+                track_id: Some(m.track_id.0),
+                track_index: project.track_index(m.track_id),
             })
             .collect(),
-        notes: entry
-            .project
+        notes: project
             .notes
             .iter()
             .map(|n| NoteFile {
@@ -293,20 +360,43 @@ pub fn save_project(root: &Path, entry: &mut DiskProject) -> Result<(), String> 
                 duration_secs: n.duration_secs,
             })
             .collect(),
-        seq_clips: entry
-            .project
+        seq_clips: project
             .seq_clips
             .iter()
             .map(|s| SeqClipFile {
                 id: s.id.0,
-                track_index: s.track_index,
+                track_id: Some(s.track_id.0),
+                track_index: project.track_index(s.track_id),
                 start_time_secs: s.start_time_secs,
                 duration_secs: s.duration_secs,
             })
             .collect(),
     };
     let body = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
-    write_json_atomic(&dir.join("project.json"), &body)
+    fs::write(next.join("project.json"), body).map_err(|e| e.to_string())?;
+
+    publish_dir(&dest, &next, &bak)?;
+    *sample_files = ptr_to_file;
+    Ok(())
+}
+
+fn publish_dir(dest: &Path, next: &Path, bak: &Path) -> Result<(), String> {
+    let _ = fs::remove_dir_all(bak);
+    if dest.exists() {
+        fs::rename(dest, bak).map_err(|e| e.to_string())?;
+    }
+    match fs::rename(next, dest) {
+        Ok(()) => {
+            let _ = fs::remove_dir_all(bak);
+            Ok(())
+        }
+        Err(e) => {
+            if bak.exists() && !dest.exists() {
+                let _ = fs::rename(bak, dest);
+            }
+            Err(e.to_string())
+        }
+    }
 }
 
 fn next_sample_name(samples_dir: &Path, used: &HashSet<String>) -> String {
@@ -331,117 +421,146 @@ fn scale_index(idx: usize, src_rate: u32, dst_rate: u32, max: usize) -> usize {
     scaled.min(max)
 }
 
-pub fn load_project(root: &Path, id: u64, device_sample_rate: u32) -> Result<DiskProject, String> {
-    let dir = project_dir(root, id);
+pub struct LoadedProject {
+    pub project: Project,
+    pub sample_files: SampleFileMap,
+    pub warnings: Vec<String>,
+}
+
+pub fn load_project(root: &Path, id: u64) -> Result<LoadedProject, String> {
+    let dir = resolve_project_dir(root, id)
+        .ok_or_else(|| format!("проект {id} не найден"))?;
     let path = dir.join("project.json");
     let raw = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let file: ProjectFile = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
     if file.format != FORMAT {
         return Err(format!("неизвестный формат проекта {}", file.format));
     }
-    let src_rate = file.pcm_sample_rate.max(1);
-    let dst_rate = device_sample_rate.max(1);
     let samples_dir = dir.join("samples");
+    let mut warnings = Vec::new();
 
-    let mut cache: HashMap<String, crate::model::Sample> = HashMap::new();
-    let mut sample_files: HashMap<usize, String> = HashMap::new();
-    let mut clips = Vec::with_capacity(file.clips.len());
+    let mut cache: HashMap<String, Sample> = HashMap::new();
+    let mut sample_files: SampleFileMap = HashMap::new();
 
-    for c in file.clips {
-        let sample = if let Some(name) = c.sample.as_ref() {
-            if let Some(existing) = cache.get(name) {
-                existing.clone()
-            } else {
-                let wav_path = samples_dir.join(name);
-                let loaded = wav_loader::load_wav_mono_f32(&wav_path, dst_rate)?;
-                cache.insert(name.clone(), loaded.clone());
-                loaded
+    let load_named = |name: &str,
+                      cache: &mut HashMap<String, Sample>,
+                      sample_files: &mut SampleFileMap,
+                      warnings: &mut Vec<String>|
+     -> Option<Sample> {
+        if let Some(existing) = cache.get(name) {
+            return Some(existing.clone());
+        }
+        let wav_path = samples_dir.join(name);
+        match wav_loader::load_wav_mono_f32(&wav_path) {
+            Ok(loaded) => {
+                let ptr = std::sync::Arc::as_ptr(&loaded.data) as usize;
+                sample_files.insert(ptr, name.to_string());
+                cache.insert(name.to_string(), loaded.clone());
+                Some(loaded)
             }
+            Err(e) => {
+                warnings.push(format!("{name}: {e}"));
+                None
+            }
+        }
+    };
+
+    let mut clip_by_track: HashMap<usize, (Option<Sample>, String)> = HashMap::new();
+    for c in &file.clips {
+        if clip_by_track.contains_key(&c.track_index) {
+            continue;
+        }
+        let sample = c
+            .sample
+            .as_ref()
+            .and_then(|name| load_named(name, &mut cache, &mut sample_files, &mut warnings));
+        clip_by_track.insert(c.track_index, (sample, c.label.clone()));
+    }
+
+    let mut next_track_id = file.next_track_id.max(1);
+    let mut seen_track = HashSet::new();
+    let mut tracks: Vec<Track> = Vec::new();
+    for (ti, t) in file.tracks.into_iter().enumerate() {
+        let id_raw = if t.id == 0 || !seen_track.insert(t.id) {
+            let id = next_track_id;
+            next_track_id = next_track_id.saturating_add(1).max(1);
+            id
         } else {
-            let data = std::sync::Arc::new(Vec::new());
-            crate::model::Sample::new_mono(data, std::sync::Arc::new(PeakPyramid::build(&[])))
+            next_track_id = next_track_id.max(t.id.saturating_add(1));
+            t.id
         };
-        let n = sample.data.len();
-        let ptr = std::sync::Arc::as_ptr(&sample.data) as usize;
-        if let Some(name) = c.sample.as_ref() {
-            sample_files.insert(ptr, name.clone());
-        }
-        let trim_start = scale_index(c.trim_start, src_rate, dst_rate, n);
-        let mut trim_end = scale_index(c.trim_end, src_rate, dst_rate, n);
-        if trim_end < trim_start {
-            trim_end = trim_start;
-        }
-        clips.push(Clip {
-            id: ClipId(c.id),
-            start_time_secs: c.start_time_secs.max(0.0),
-            label: c.label,
+        let (legacy_sample, legacy_label) = clip_by_track.remove(&ti).unwrap_or((None, String::new()));
+        let sample = t
+            .sample
+            .as_ref()
+            .and_then(|name| load_named(name, &mut cache, &mut sample_files, &mut warnings))
+            .or(legacy_sample);
+        let sample_label = if t.sample_label.is_empty() {
+            legacy_label
+        } else {
+            t.sample_label
+        };
+        let n = sample.as_ref().map(|s| s.data.len()).unwrap_or(0);
+        let src_rate = file.pcm_sample_rate;
+        let dst_rate = sample.as_ref().map(|s| s.rate()).unwrap_or(src_rate.max(1));
+        let max_i = n.saturating_sub(1);
+        let mut seen = [false; 16];
+        let default_len = pad_default_len(dst_rate, file.tempo_bpm);
+        let pad_markers = if n == 0 {
+            Vec::new()
+        } else {
+            t.pad_markers
+                .into_iter()
+                .filter_map(|m| {
+                    let i = m.slot as usize;
+                    if i >= 16 || seen[i] {
+                        return None;
+                    }
+                    let start_raw = m.start_index.or(m.sample_index)?;
+                    let start = scale_index(start_raw, src_rate, dst_rate, max_i);
+                    let end = if let Some(end_raw) = m.end_index {
+                        scale_index(end_raw, src_rate, dst_rate, n)
+                    } else {
+                        pad_range_from_start(start, n, default_len)?.1
+                    };
+                    let end = if end <= start {
+                        pad_range_from_start(start, n, default_len)?.1
+                    } else {
+                        end
+                    };
+                    seen[i] = true;
+                    Some(PadMarker {
+                        slot: m.slot,
+                        start_index: start,
+                        end_index: end,
+                    })
+                })
+                .collect()
+        };
+        tracks.push(Track {
+            id: TrackId(id_raw),
+            name: t.name,
+            pitch_semitones: t.pitch_semitones.clamp(-24, 24),
             sample,
-            trim_start,
-            trim_end,
-            track_index: c.track_index,
-            placement_preview: false,
+            sample_label,
+            pad_markers,
         });
     }
 
-    let tracks: Vec<Track> = file
-        .tracks
-        .into_iter()
-        .enumerate()
-        .map(|(ti, t)| {
-            let n = clips
-                .iter()
-                .find(|c| c.track_index == ti)
-                .map(|c| c.sample.data.len())
-                .unwrap_or(0);
-            let max_i = n.saturating_sub(1);
-            let mut seen = [false; 16];
-            let default_len = pad_default_len(dst_rate, t.source_tempo_bpm);
-            let pad_markers = if n == 0 {
-                Vec::new()
-            } else {
-                t.pad_markers
-                    .into_iter()
-                    .filter_map(|m| {
-                        let i = m.slot as usize;
-                        if i >= 16 || seen[i] {
-                            return None;
-                        }
-                        let start_raw = m.start_index.or(m.sample_index)?;
-                        let start = scale_index(start_raw, src_rate, dst_rate, max_i);
-                        let end = if let Some(end_raw) = m.end_index {
-                            scale_index(end_raw, src_rate, dst_rate, n)
-                        } else {
-                            pad_range_from_start(start, n, default_len)?.1
-                        };
-                        let end = if end <= start {
-                            pad_range_from_start(start, n, default_len)?.1
-                        } else {
-                            end
-                        };
-                        seen[i] = true;
-                        Some(PadMarker {
-                            slot: m.slot,
-                            start_index: start,
-                            end_index: end,
-                        })
-                    })
-                    .collect()
-            };
-            Track {
-                name: t.name,
-                pitch_semitones: t.pitch_semitones.clamp(-24, 24),
-                source_tempo_bpm: t.source_tempo_bpm.clamp(20.0, 400.0),
-                pad_markers,
-            }
-        })
-        .collect();
+    let id_at = |ti: usize| tracks.get(ti).map(|t| t.id);
 
-    let n_tracks = tracks.len();
     let mut next_seq_id = file.next_seq_id.max(1);
     let mut seen_seq = HashSet::new();
     let mut seq_clips: Vec<SeqClip> = Vec::new();
     for s in file.seq_clips {
-        if s.track_index >= n_tracks || s.duration_secs <= 0.0 {
+        let track_id = s
+            .track_id
+            .map(TrackId)
+            .or_else(|| s.track_index.and_then(id_at));
+        let Some(track_id) = track_id else {
+            continue;
+        };
+        if project_track_missing(&tracks, track_id) || s.duration_secs <= 0.0 {
             continue;
         }
         let id = if s.id == 0 {
@@ -457,7 +576,7 @@ pub fn load_project(root: &Path, id: u64, device_sample_rate: u32) -> Result<Dis
         };
         seq_clips.push(SeqClip {
             id: SeqId(id),
-            track_index: s.track_index,
+            track_id,
             start_time_secs: s.start_time_secs.max(0.0),
             duration_secs: s.duration_secs,
         });
@@ -465,7 +584,7 @@ pub fn load_project(root: &Path, id: u64, device_sample_rate: u32) -> Result<Dis
 
     let mut seen_note_ids = HashSet::new();
     let mut notes: Vec<PadNote> = Vec::new();
-    let mut orphan_by_track: Vec<(usize, NoteFile)> = Vec::new();
+    let mut orphan_by_track: Vec<(TrackId, NoteFile)> = Vec::new();
     for n in file.notes {
         if n.slot >= 16 || n.duration_secs <= 0.0 {
             continue;
@@ -485,19 +604,17 @@ pub fn load_project(root: &Path, id: u64, device_sample_rate: u32) -> Result<Dis
                 continue;
             }
         }
-        if let Some(track_index) = n.track_index {
-            if track_index < n_tracks {
-                orphan_by_track.push((track_index, n));
-            }
+        if let Some(track_id) = n.track_index.and_then(id_at) {
+            orphan_by_track.push((track_id, n));
         }
     }
 
     if seq_clips.is_empty() {
-        let default_dur = crate::project_actions::default_seq_duration_secs(file.tempo_bpm);
-        for ti in 0..n_tracks {
+        let default_dur = crate::time::default_seq_duration_secs(file.tempo_bpm);
+        for track in &tracks {
             let related: Vec<&NoteFile> = orphan_by_track
                 .iter()
-                .filter(|(t, _)| *t == ti)
+                .filter(|(t, _)| *t == track.id)
                 .map(|(_, n)| n)
                 .collect();
             let start = related
@@ -513,29 +630,29 @@ pub fn load_project(root: &Path, id: u64, device_sample_rate: u32) -> Result<Dis
             next_seq_id = next_seq_id.saturating_add(1).max(1);
             seq_clips.push(SeqClip {
                 id: SeqId(id),
-                track_index: ti,
+                track_id: track.id,
                 start_time_secs: start,
                 duration_secs: (end - start).max(default_dur),
             });
         }
     } else {
-        for ti in 0..n_tracks {
-            if seq_clips.iter().any(|s| s.track_index == ti) {
+        for track in &tracks {
+            if seq_clips.iter().any(|s| s.track_id == track.id) {
                 continue;
             }
             let id = next_seq_id;
             next_seq_id = next_seq_id.saturating_add(1).max(1);
             seq_clips.push(SeqClip {
                 id: SeqId(id),
-                track_index: ti,
+                track_id: track.id,
                 start_time_secs: 0.0,
-                duration_secs: crate::project_actions::default_seq_duration_secs(file.tempo_bpm),
+                duration_secs: crate::time::default_seq_duration_secs(file.tempo_bpm),
             });
         }
     }
 
-    for (track_index, n) in orphan_by_track {
-        let Some(seq) = seq_clips.iter().find(|s| s.track_index == track_index) else {
+    for (track_id, n) in orphan_by_track {
+        let Some(seq) = seq_clips.iter().find(|s| s.track_id == track_id) else {
             continue;
         };
         let local = (n.start_time_secs - seq.start_time_secs).max(0.0);
@@ -560,91 +677,110 @@ pub fn load_project(root: &Path, id: u64, device_sample_rate: u32) -> Result<Dis
         }
     }
 
-    let project = Project {
-        name: file.name,
-        clips,
-        transport: crate::model::Transport::default(),
-        device_sample_rate: dst_rate,
-        next_clip_id: file.next_clip_id.max(1),
-        markers: file
-            .markers
-            .into_iter()
-            .map(|m| CueMarker {
+    let markers = file
+        .markers
+        .into_iter()
+        .filter_map(|m| {
+            let track_id = m.track_id.map(TrackId).or_else(|| m.track_index.and_then(id_at))?;
+            if project_track_missing(&tracks, track_id) {
+                return None;
+            }
+            Some(CueMarker {
                 slot: m.slot,
                 time_secs: m.time_secs.max(0.0),
-                track_index: m.track_index,
+                track_id,
             })
-            .collect(),
-        tracks,
+        })
+        .collect();
+
+    let project = Project {
+        name: file.name,
+        transport: crate::model::Transport::default(),
+        markers,
         notes,
         seq_clips,
+        tracks,
         next_note_id,
         next_seq_id,
+        next_track_id,
         tempo_bpm: file.tempo_bpm.clamp(20.0, 400.0),
         sampler_preview: crate::model::SamplerPreview::default(),
     };
 
-    Ok(DiskProject {
-        id: file.id.max(id),
+    Ok(LoadedProject {
         project,
         sample_files,
+        warnings,
     })
 }
 
-pub fn load_library(root: &Path, device_sample_rate: u32) -> (Vec<DiskProject>, u64, Option<String>) {
+fn project_track_missing(tracks: &[Track], id: TrackId) -> bool {
+    !tracks.iter().any(|t| t.id == id)
+}
+
+fn parse_project_id(name: &str) -> Option<u64> {
+    let rest = name.strip_prefix('p')?;
+    let num = rest.split('.').next()?;
+    num.parse().ok()
+}
+
+/// Index only: names and track counts, no PCM.
+pub fn load_library_index(root: &Path) -> (Vec<LibraryMeta>, u64, Option<String>) {
     if let Err(e) = ensure_root(root) {
         return (Vec::new(), 1, Some(e));
     }
 
     let mut next_id = 1u64;
-    if let Ok(raw) = fs::read_to_string(index_path(root)) {
-        if let Ok(idx) = serde_json::from_str::<LibraryFile>(&raw) {
-            if idx.format == FORMAT {
-                next_id = idx.next_project_id.max(1);
-            }
-        }
+    if let Some(idx) = load_index_file(root) {
+        next_id = idx.next_project_id.max(1);
     }
 
-    let mut loaded = Vec::new();
-    let mut errors = Vec::new();
-    let dir = projects_dir(root);
-    let rd = match fs::read_dir(&dir) {
-        Ok(rd) => rd,
-        Err(_) => return (loaded, next_id, None),
-    };
     let mut ids = Vec::new();
-    for ent in rd.flatten() {
-        let name = ent.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        let Some(rest) = name.strip_prefix('p') else {
-            continue;
-        };
-        if let Ok(id) = rest.parse::<u64>() {
-            if ent.path().join("project.json").is_file() {
-                ids.push(id);
+    let dir = projects_dir(root);
+    if let Ok(rd) = fs::read_dir(&dir) {
+        for ent in rd.flatten() {
+            let name = ent.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if let Some(id) = parse_project_id(name) {
+                if resolve_project_dir(root, id).is_some() {
+                    ids.push(id);
+                }
             }
         }
     }
     ids.sort_unstable();
     ids.dedup();
+
+    let mut loaded = Vec::new();
+    let mut errors = Vec::new();
     for id in ids {
-        match load_project(root, id, device_sample_rate) {
-            Ok(p) => {
-                next_id = next_id.max(p.id.saturating_add(1));
-                loaded.push(p);
+        match load_meta(root, id) {
+            Ok(meta) => {
+                next_id = next_id.max(meta.id.saturating_add(1));
+                loaded.push(meta);
             }
             Err(e) => errors.push(format!("проект {id}: {e}")),
         }
     }
-
     let err = if errors.is_empty() {
         None
     } else {
         Some(errors.join("; "))
     };
     (loaded, next_id, err)
+}
+
+fn load_meta(root: &Path, id: u64) -> Result<LibraryMeta, String> {
+    let dir = resolve_project_dir(root, id).ok_or_else(|| "нет project.json".to_string())?;
+    let raw = fs::read_to_string(dir.join("project.json")).map_err(|e| e.to_string())?;
+    let file: ProjectFile = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    Ok(LibraryMeta {
+        id: file.id.max(id),
+        name: file.name,
+        track_count: file.tracks.len(),
+    })
 }
 
 #[cfg(test)]
@@ -655,10 +791,10 @@ mod tests {
     use crate::model::Sample;
     use crate::project_actions;
 
-    fn dummy_sample(n: usize, v: f32) -> Sample {
+    fn dummy_sample(n: usize, v: f32, rate: u32) -> Sample {
         let data = vec![v; n];
         let peaks = PeakPyramid::build(&data);
-        Sample::new_mono(Arc::new(data), Arc::new(peaks))
+        Sample::new_mono(Arc::new(data), Arc::new(peaks), rate)
     }
 
     fn temp_root(tag: &str) -> PathBuf {
@@ -675,16 +811,15 @@ mod tests {
     #[test]
     fn roundtrip_project_with_shared_sample() {
         let root = temp_root("roundtrip");
-        let mut project = Project::empty(48_000);
+        let mut project = Project::empty();
         project.name = "Test".into();
         project.tempo_bpm = 96.0;
-        let sample = dummy_sample(32, 0.25);
+        let sample = dummy_sample(32, 0.25, 48_000);
         let t0 = project_actions::add_track(&mut project);
         project_actions::set_track_sample(&mut project, t0, sample.clone(), "kick.wav".into());
         let t1 = project_actions::add_track(&mut project);
         project_actions::set_track_sample(&mut project, t1, sample, "kick.wav".into());
-        project.clips[1].start_time_secs = 1.5;
-        project_actions::try_place_marker(&mut project, 0.5, 0);
+        project_actions::try_place_marker(&mut project, 0.5, t0);
         assert_eq!(
             project_actions::try_place_pad_marker(&mut project, t0, 7, 32, 8),
             Some(0)
@@ -692,8 +827,8 @@ mod tests {
         let seq0 = project_actions::seq_clip_on_track(&project, t0).unwrap();
         assert!(project_actions::place_pad_note(&mut project, seq0, 0, 0.5).is_some());
 
-        let mut entry = DiskProject::new(7, project);
-        save_project(&root, &mut entry).unwrap();
+        let mut files = SampleFileMap::new();
+        save_project(&root, 7, &project, &mut files).unwrap();
         save_index(&root, 8).unwrap();
 
         let samples = fs::read_dir(project_dir(&root, 7).join("samples"))
@@ -703,30 +838,91 @@ mod tests {
             .count();
         assert_eq!(samples, 1, "shared Arc should write one wav");
 
-        let (lib, next, err) = load_library(&root, 48_000);
+        let (lib, next, err) = load_library_index(&root);
         assert!(err.is_none(), "{err:?}");
         assert_eq!(next, 8);
         assert_eq!(lib.len(), 1);
-        let loaded = &lib[0].project;
+        assert_eq!(lib[0].name, "Test");
+        assert_eq!(lib[0].track_count, 2);
+
+        let loaded = load_project(&root, 7).unwrap();
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        let loaded = loaded.project;
         assert_eq!(loaded.name, "Test");
         assert_eq!(loaded.tempo_bpm, 96.0);
         assert_eq!(loaded.tracks.len(), 2);
-        assert_eq!(loaded.clips.len(), 2);
-        assert_eq!(loaded.clips[0].sample.data.len(), 32);
-        assert!((loaded.clips[0].sample.data[0] - 0.25).abs() < 1e-5);
-        assert_eq!(loaded.clips[1].start_time_secs, 1.5);
+        assert_eq!(loaded.tracks[0].sample.as_ref().unwrap().data.len(), 32);
+        assert!((loaded.tracks[0].sample.as_ref().unwrap().data[0] - 0.25).abs() < 1e-5);
+        assert_eq!(loaded.tracks[0].sample.as_ref().unwrap().sample_rate, 48_000);
         assert_eq!(loaded.markers.len(), 1);
         assert_eq!(loaded.tracks[0].pad_markers.len(), 1);
         assert_eq!(loaded.tracks[0].pad_markers[0].start_index, 7);
         assert_eq!(loaded.tracks[0].pad_markers[0].end_index, 15);
         assert_eq!(loaded.notes.len(), 1);
-        assert_eq!(loaded.notes[0].slot, 0);
         assert_eq!(loaded.seq_clips.len(), 2);
-        assert_eq!(
-            loaded.notes[0].seq_id,
-            loaded.seq_clips.iter().find(|s| s.track_index == 0).unwrap().id
-        );
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn missing_wav_does_not_fail_the_project() {
+        let root = temp_root("missing");
+        let mut project = Project::empty();
+        let t0 = project_actions::add_track(&mut project);
+        project_actions::set_track_sample(&mut project, t0, dummy_sample(8, 0.1, 48_000), "a".into());
+        let mut files = SampleFileMap::new();
+        save_project(&root, 1, &project, &mut files).unwrap();
+        let samples = project_dir(&root, 1).join("samples");
+        for ent in fs::read_dir(&samples).unwrap().flatten() {
+            let _ = fs::remove_file(ent.path());
+        }
+        let loaded = load_project(&root, 1).unwrap();
+        assert!(!loaded.warnings.is_empty());
+        assert!(loaded.project.tracks[0].sample.is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn interrupted_publish_recovers_from_bak() {
+        let root = temp_root("bak");
+        let mut project = Project::empty();
+        project.name = "Alive".into();
+        let t0 = project_actions::add_track(&mut project);
+        project_actions::set_track_sample(&mut project, t0, dummy_sample(8, 0.2, 48_000), "a".into());
+        let mut files = SampleFileMap::new();
+        save_project(&root, 3, &project, &mut files).unwrap();
+        let dest = project_dir(&root, 3);
+        let bak = project_bak_dir(&root, 3);
+        fs::rename(&dest, &bak).unwrap();
+        let loaded = load_project(&root, 3).unwrap();
+        assert_eq!(loaded.project.name, "Alive");
+        assert!(loaded.project.tracks[0].sample.is_some());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn replacing_sample_drops_old_wav() {
+        let root = temp_root("replace");
+        let mut project = Project::empty();
+        let t0 = project_actions::add_track(&mut project);
+        project_actions::set_track_sample(&mut project, t0, dummy_sample(8, 0.1, 48_000), "a".into());
+        let mut files = SampleFileMap::new();
+        save_project(&root, 1, &project, &mut files).unwrap();
+        project_actions::set_track_sample(
+            &mut project,
+            t0,
+            dummy_sample(16, 0.9, 48_000),
+            "b".into(),
+        );
+        save_project(&root, 1, &project, &mut files).unwrap();
+        let n = fs::read_dir(project_dir(&root, 1).join("samples"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("wav"))
+            .count();
+        assert_eq!(n, 1);
+        let loaded = load_project(&root, 1).unwrap();
+        assert_eq!(loaded.project.tracks[0].sample.as_ref().unwrap().data.len(), 16);
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -737,36 +933,20 @@ mod tests {
         assert_eq!(m.sample_index, Some(9));
         assert_eq!(m.start_index, None);
         assert_eq!(m.end_index, None);
-        let m: PadMarkerFile =
-            serde_json::from_str(r#"{"slot":1,"start_index":4,"end_index":20}"#).unwrap();
-        assert_eq!(m.start_index, Some(4));
-        assert_eq!(m.end_index, Some(20));
-        assert_eq!(m.sample_index, None);
     }
 
     #[test]
-    fn replacing_sample_drops_old_wav() {
-        let root = temp_root("replace");
-        let mut project = Project::empty(48_000);
+    fn load_meta_does_not_need_wavs() {
+        let root = temp_root("meta");
+        let mut project = Project::empty();
+        project.name = "Card".into();
         let t0 = project_actions::add_track(&mut project);
-        project_actions::set_track_sample(&mut project, t0, dummy_sample(8, 0.1), "a".into());
-        let mut entry = DiskProject::new(1, project);
-        save_project(&root, &mut entry).unwrap();
-        project_actions::set_track_sample(
-            &mut entry.project,
-            t0,
-            dummy_sample(16, 0.9),
-            "b".into(),
-        );
-        save_project(&root, &mut entry).unwrap();
-        let n = fs::read_dir(project_dir(&root, 1).join("samples"))
-            .unwrap()
-            .flatten()
-            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("wav"))
-            .count();
-        assert_eq!(n, 1);
-        let loaded = load_project(&root, 1, 48_000).unwrap();
-        assert_eq!(loaded.project.clips[0].sample.data.len(), 16);
+        project_actions::set_track_sample(&mut project, t0, dummy_sample(8, 0.1, 22_050), "a".into());
+        let mut files = SampleFileMap::new();
+        save_project(&root, 4, &project, &mut files).unwrap();
+        let meta = load_meta(&root, 4).unwrap();
+        assert_eq!(meta.name, "Card");
+        assert_eq!(meta.track_count, 1);
         let _ = fs::remove_dir_all(&root);
     }
 }
