@@ -1,8 +1,10 @@
 //! Modal sampling instrument: preview, pitch, tempo, overview map, main waveform, pads.
 
-use egui::{Align2, Color32, FontId, Key, PointerButton, Pos2, Rect, Sense, Stroke, Vec2};
+use egui::{
+    Align2, Color32, CursorIcon, Event, FontId, Key, PointerButton, Pos2, Rect, Sense, Shape, Stroke, Vec2,
+};
 
-use crate::model::PadMarker;
+use crate::model::{PadEdge, PadMarker};
 use crate::theme;
 use crate::waveform::{self, PeakPyramid};
 
@@ -52,21 +54,59 @@ pub enum SamplerAction {
     TempoDelta(f32),
     LoadFile,
     SeekCursor { sample_index: usize },
-    MovePad { slot: u8, sample_index: usize },
+    MovePad {
+        slot: u8,
+        edge: PadEdge,
+        sample_index: usize,
+    },
     DeletePad { slot: u8 },
     SelectPad { slot: Option<u8> },
     TriggerPad { slot: u8 },
 }
 
 pub fn pad_slot_from_keys(i: &egui::InputState) -> Option<u8> {
+    pad_slots_pressed(i).next()
+}
+
+pub fn pad_slots_pressed(i: &egui::InputState) -> impl Iterator<Item = u8> + '_ {
+    pad_slots_where(i, key_pressed_no_repeat)
+}
+
+fn key_pressed_no_repeat(i: &egui::InputState, k: Key) -> bool {
+    i.events.iter().any(|e| {
+        matches!(
+            e,
+            Event::Key {
+                key,
+                pressed: true,
+                repeat: false,
+                ..
+            } if *key == k
+        )
+    })
+}
+
+pub fn pad_key_down(i: &egui::InputState, slot: u8) -> bool {
     if i.modifiers.ctrl || i.modifiers.command || i.modifiers.alt {
-        return None;
+        return false;
     }
     PAD_KEYS
-        .into_iter()
-        .enumerate()
-        .find(|(_, k)| i.key_pressed(*k))
-        .map(|(i, _)| i as u8)
+        .get(slot as usize)
+        .is_some_and(|k| i.key_down(*k))
+}
+
+fn pad_slots_where<'a>(
+    i: &'a egui::InputState,
+    pred: impl Fn(&egui::InputState, Key) -> bool + 'a,
+) -> impl Iterator<Item = u8> + 'a {
+    let blocked = i.modifiers.ctrl || i.modifiers.command || i.modifiers.alt;
+    PAD_KEYS.into_iter().enumerate().filter_map(move |(idx, k)| {
+        if blocked || !pred(i, k) {
+            None
+        } else {
+            Some(idx as u8)
+        }
+    })
 }
 
 pub fn show(
@@ -74,7 +114,7 @@ pub fn show(
     model: SamplerModel<'_>,
     view_start: &mut f32,
     view_len: &mut f32,
-    pad_drag: &mut Option<u8>,
+    pad_drag: &mut Option<(u8, PadEdge)>,
 ) -> Option<SamplerAction> {
     let mut action = None;
     let screen = ctx.screen_rect();
@@ -208,7 +248,7 @@ pub fn show(
             } else {
                 ui.label(
                     egui::RichText::new(
-                        "Клик по waveform — базовая позиция. Стоп возвращает курсор к ней. Alt+скролл — горизонтально. Свободный пэд (Q–I / A–K) — метка на курсор.",
+                        "Клик по waveform — базовая позиция. Стоп возвращает курсор к ней. Alt+скролл — горизонтально. Полоски — начало и конец сэмпла, тяни чтобы изменить длину. Свободный пэд (Q–I / A–K) — сэмпл от курсора.",
                     )
                     .weak()
                     .size(12.0),
@@ -312,10 +352,15 @@ fn pan_view_alt_scroll(ctx: &egui::Context, width: f32, start: &mut f32, len: f3
     *start = (*start - dy / width.max(1.0) * len).clamp(0.0, (n - len).max(0.0));
 }
 
-fn sample_at_x(x: f32, rect: Rect, view_start: f32, view_len: f32, n: f32) -> usize {
+fn sample_at_x(x: f32, rect: Rect, view_start: f32, view_len: f32, n: f32, allow_end: bool) -> usize {
     let u = ((x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
     let idx = view_start + u * view_len.max(1.0);
-    idx.round().clamp(0.0, (n - 1.0).max(0.0)) as usize
+    let max = if allow_end {
+        n.max(0.0)
+    } else {
+        (n - 1.0).max(0.0)
+    };
+    idx.round().clamp(0.0, max) as usize
 }
 
 fn sample_to_x(index: usize, rect: Rect, view_start: f32, view_len: f32) -> f32 {
@@ -326,17 +371,56 @@ fn sample_to_x(index: usize, rect: Rect, view_start: f32, view_len: f32) -> f32 
 const MARKER_CHIP_W: f32 = 22.0;
 const MARKER_CHIP_H: f32 = 18.0;
 const MARKER_DELETE_W: f32 = 14.0;
-const MARKER_HIT_PX: f32 = 8.0;
+const PAD_TRI: f32 = 24.0;
 
-fn marker_chip_rect(index: usize, wave: Rect, view_start: f32, view_len: f32, selected: bool) -> Rect {
-    let x = sample_to_x(index, wave, view_start, view_len);
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PadHit {
+    Start,
+    End,
+    Delete,
+    Body,
+}
+
+fn start_triangle(x: f32, wave: Rect) -> [Pos2; 3] {
+    let top = wave.top();
+    [
+        Pos2::new(x, top),
+        Pos2::new(x - PAD_TRI, top),
+        Pos2::new(x, top + PAD_TRI),
+    ]
+}
+
+fn end_triangle(x: f32, wave: Rect) -> [Pos2; 3] {
+    let bot = wave.bottom();
+    [
+        Pos2::new(x, bot),
+        Pos2::new(x + PAD_TRI, bot),
+        Pos2::new(x, bot - PAD_TRI),
+    ]
+}
+
+fn pos_in_start_tri(pos: Pos2, x: f32, wave: Rect) -> bool {
+    let dx = x - pos.x;
+    let dy = pos.y - wave.top();
+    dx >= -2.0 && dy >= -2.0 && dx + dy <= PAD_TRI + 2.0
+}
+
+fn pos_in_end_tri(pos: Pos2, x: f32, wave: Rect) -> bool {
+    let dx = pos.x - x;
+    let dy = wave.bottom() - pos.y;
+    dx >= -2.0 && dy >= -2.0 && dx + dy <= PAD_TRI + 2.0
+}
+
+fn marker_chip_rect(x0: f32, x1: f32, wave: Rect, selected: bool) -> Rect {
     let w = if selected {
         MARKER_CHIP_W + MARKER_DELETE_W
     } else {
         MARKER_CHIP_W
     };
+    let mid = (x0 + x1) * 0.5;
+    let x = (mid - w * 0.5).clamp(wave.left() + 2.0, (wave.right() - w - 2.0).max(wave.left() + 2.0));
     Rect::from_min_size(
-        Pos2::new(x - MARKER_CHIP_W * 0.5, wave.top() + 4.0),
+        Pos2::new(x, wave.top() + 4.0),
         Vec2::new(w, MARKER_CHIP_H),
     )
 }
@@ -355,25 +439,42 @@ fn hit_pad_marker(
     view_start: f32,
     view_len: f32,
     selected: Option<u8>,
-) -> Option<(u8, bool)> {
-    let mut hits: Vec<(u8, bool, f32)> = Vec::new();
+) -> Option<(u8, PadHit)> {
+    let mut hits: Vec<(u8, PadHit, u8, f32)> = Vec::new();
     for m in markers {
         if (m.slot as usize) >= PAD_COUNT {
             continue;
         }
         let is_sel = selected == Some(m.slot);
-        let chip = marker_chip_rect(m.sample_index, wave, view_start, view_len, is_sel);
-        let x = sample_to_x(m.sample_index, wave, view_start, view_len);
+        let x0 = sample_to_x(m.start_index, wave, view_start, view_len);
+        let x1 = sample_to_x(m.end_index, wave, view_start, view_len);
+        let left = x0.min(x1);
+        let right = x0.max(x1);
+        let chip = marker_chip_rect(x0, x1, wave, is_sel);
         let on_chip = chip.contains(pos);
-        let on_line = (pos.x - x).abs() <= MARKER_HIT_PX && wave.contains(pos);
-        if !on_chip && !on_line {
-            continue;
-        }
         let on_delete = is_sel && on_chip && marker_delete_rect(chip).contains(pos);
-        hits.push((m.slot, on_delete, (x - pos.x).abs()));
+        if on_delete {
+            hits.push((m.slot, PadHit::Delete, 0, 0.0));
+        }
+        let on_start = pos_in_start_tri(pos, x0, wave);
+        let on_end = pos_in_end_tri(pos, x1, wave);
+        if on_start {
+            hits.push((m.slot, PadHit::Start, 1, (x0 - pos.x).abs()));
+        }
+        if on_end {
+            hits.push((m.slot, PadHit::End, 1, (x1 - pos.x).abs()));
+        }
+        let on_body = wave.contains(pos) && pos.x >= left && pos.x <= right;
+        if on_body || (on_chip && !on_delete) {
+            let center = (left + right) * 0.5;
+            hits.push((m.slot, PadHit::Body, 2, (center - pos.x).abs()));
+        }
     }
-    hits.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
-    hits.first().map(|&(slot, del, _)| (slot, del))
+    hits.sort_by(|a, b| {
+        a.2.cmp(&b.2)
+            .then_with(|| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    hits.first().map(|&(slot, hit, _, _)| (slot, hit))
 }
 
 fn handle_wave_markers(
@@ -383,30 +484,53 @@ fn handle_wave_markers(
     view_start: f32,
     view_len: f32,
     n: f32,
-    pad_drag: &mut Option<u8>,
+    pad_drag: &mut Option<(u8, PadEdge)>,
 ) -> Option<SamplerAction> {
     let ctrl = resp.ctx.input(|i| i.modifiers.ctrl || i.modifiers.command);
     let pos = resp.interact_pointer_pos();
 
-    if resp.drag_started_by(PointerButton::Primary) {
-        if let Some(pos) = pos {
-            if let Some((slot, on_delete)) =
-                hit_pad_marker(model.pad_markers, pos, wave, view_start, view_len, model.selected_pad)
+    if resp.hovered() {
+        if let Some(hover) = resp.hover_pos() {
+            if let Some((_, hit)) =
+                hit_pad_marker(model.pad_markers, hover, wave, view_start, view_len, model.selected_pad)
             {
-                if !on_delete {
-                    *pad_drag = Some(slot);
-                    return Some(SamplerAction::SelectPad { slot: Some(slot) });
+                if matches!(hit, PadHit::Start | PadHit::End) {
+                    resp.ctx.set_cursor_icon(CursorIcon::ResizeHorizontal);
                 }
             }
         }
     }
 
-    if let Some(slot) = *pad_drag {
+    if resp.drag_started_by(PointerButton::Primary) {
+        if let Some(pos) = pos {
+            if let Some((slot, hit)) =
+                hit_pad_marker(model.pad_markers, pos, wave, view_start, view_len, model.selected_pad)
+            {
+                match hit {
+                    PadHit::Start => {
+                        *pad_drag = Some((slot, PadEdge::Start));
+                        return Some(SamplerAction::SelectPad { slot: Some(slot) });
+                    }
+                    PadHit::End => {
+                        *pad_drag = Some((slot, PadEdge::End));
+                        return Some(SamplerAction::SelectPad { slot: Some(slot) });
+                    }
+                    PadHit::Body => {
+                        return Some(SamplerAction::SelectPad { slot: Some(slot) });
+                    }
+                    PadHit::Delete => {}
+                }
+            }
+        }
+    }
+
+    if let Some((slot, edge)) = *pad_drag {
         if resp.dragged_by(PointerButton::Primary) {
             if let Some(pos) = pos {
-                let idx = sample_at_x(pos.x, wave, view_start, view_len, n);
+                let idx = sample_at_x(pos.x, wave, view_start, view_len, n, edge == PadEdge::End);
                 return Some(SamplerAction::MovePad {
                     slot,
+                    edge,
                     sample_index: idx,
                 });
             }
@@ -418,16 +542,16 @@ fn handle_wave_markers(
 
     if resp.clicked() && !ctrl {
         let pos = pos?;
-        if let Some((slot, on_delete)) =
+        if let Some((slot, hit)) =
             hit_pad_marker(model.pad_markers, pos, wave, view_start, view_len, model.selected_pad)
         {
-            if on_delete {
+            if hit == PadHit::Delete {
                 *pad_drag = None;
                 return Some(SamplerAction::DeletePad { slot });
             }
             return Some(SamplerAction::SelectPad { slot: Some(slot) });
         }
-        let idx = sample_at_x(pos.x, wave, view_start, view_len, n);
+        let idx = sample_at_x(pos.x, wave, view_start, view_len, n, false);
         Some(SamplerAction::SeekCursor { sample_index: idx })
     } else {
         None
@@ -467,10 +591,23 @@ fn paint_map(
             painter.rect_filled(vp, 2.0, theme::color_sampler_viewport());
             painter.rect_stroke(vp, 2.0, Stroke::new(1.0_f32, theme::color_sampler_viewport_stroke()));
             let col = theme::color_marker();
+            let fill = Color32::from_rgba_unmultiplied(230, 180, 64, 40);
             for m in model.pad_markers {
-                let x = rect.left() + (m.sample_index as f32 / n) * rect.width();
+                let x0 = rect.left() + (m.start_index as f32 / n) * rect.width();
+                let x1 = rect.left() + (m.end_index as f32 / n) * rect.width();
+                let band = Rect::from_min_max(
+                    Pos2::new(x0.min(x1), rect.top() + 2.0),
+                    Pos2::new(x0.max(x1), rect.bottom() - 2.0),
+                );
+                if band.width() > 0.5 {
+                    painter.rect_filled(band, 0.0, fill);
+                }
                 painter.line_segment(
-                    [Pos2::new(x, rect.top() + 2.0), Pos2::new(x, rect.bottom() - 2.0)],
+                    [Pos2::new(x0, rect.top() + 2.0), Pos2::new(x0, rect.bottom() - 2.0)],
+                    Stroke::new(1.0_f32, col),
+                );
+                painter.line_segment(
+                    [Pos2::new(x1, rect.top() + 2.0), Pos2::new(x1, rect.bottom() - 2.0)],
                     Stroke::new(1.0_f32, col),
                 );
             }
@@ -541,17 +678,49 @@ fn paint_pad_markers(
         if slot >= PAD_COUNT {
             continue;
         }
-        let idx = m.sample_index as f32;
-        if idx < view_start - 1.0 || idx > span_end + 1.0 {
+        let start_f = m.start_index as f32;
+        let end_f = m.end_index as f32;
+        if end_f < view_start - 1.0 || start_f > span_end + 1.0 {
             continue;
         }
-        let x = sample_to_x(m.sample_index, rect, view_start, view_len);
-        painter.line_segment(
-            [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
-            Stroke::new(1.5_f32, col),
-        );
         let selected = model.selected_pad == Some(m.slot);
-        let chip = marker_chip_rect(m.sample_index, rect, view_start, view_len, selected);
+        let active = model.active_pad == Some(m.slot) && model.preview_playing;
+        let x0 = sample_to_x(m.start_index, rect, view_start, view_len);
+        let x1 = sample_to_x(m.end_index, rect, view_start, view_len);
+        let fill = if active {
+            Color32::from_rgba_unmultiplied(52, 140, 92, 55)
+        } else if selected {
+            Color32::from_rgba_unmultiplied(230, 180, 64, 55)
+        } else {
+            Color32::from_rgba_unmultiplied(230, 180, 64, 28)
+        };
+        let fill_rect = Rect::from_min_max(
+            Pos2::new(x0.min(x1).max(rect.left()), rect.top()),
+            Pos2::new(x0.max(x1).min(rect.right()), rect.bottom()),
+        );
+        if fill_rect.width() > 0.5 {
+            painter.rect_filled(fill_rect, 0.0, fill);
+        }
+        let stroke = Stroke::new(if selected { 2.5_f32 } else { 1.5_f32 }, col);
+        painter.line_segment(
+            [Pos2::new(x0, rect.top()), Pos2::new(x0, rect.bottom())],
+            stroke,
+        );
+        painter.line_segment(
+            [Pos2::new(x1, rect.top()), Pos2::new(x1, rect.bottom())],
+            stroke,
+        );
+        painter.add(Shape::convex_polygon(
+            start_triangle(x0, rect).to_vec(),
+            col,
+            Stroke::NONE,
+        ));
+        painter.add(Shape::convex_polygon(
+            end_triangle(x1, rect).to_vec(),
+            col,
+            Stroke::NONE,
+        ));
+        let chip = marker_chip_rect(x0, x1, rect, selected);
         painter.rect_filled(chip, 3.0, col);
         if selected {
             painter.rect_stroke(chip, 3.0, Stroke::new(1.5_f32, Color32::WHITE));
@@ -679,12 +848,12 @@ fn show_pads(ui: &mut egui::Ui, ctx: &egui::Context, model: &SamplerModel<'_>) -
                 let resp = ui.add(btn);
                 if assigned {
                     resp.clone().on_hover_text(format!(
-                        "Пэд {} — воспроизвести с метки",
+                        "Пэд {} — воспроизвести сэмпл",
                         PAD_LABELS[slot]
                     ));
                 } else {
                     resp.clone().on_hover_text(format!(
-                        "Пэд {} — метка на курсор",
+                        "Пэд {} — сэмпл от курсора",
                         PAD_LABELS[slot]
                     ));
                 }

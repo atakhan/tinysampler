@@ -4,6 +4,44 @@ use std::sync::Arc;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ClipId(pub u64);
 
+/// Trigger of a pad chop on the studio piano roll.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct NoteId(pub u64);
+
+/// Sequence clip (“колбаска”) on a studio track.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct SeqId(pub u64);
+
+#[derive(Clone, Copy, Debug)]
+pub struct SeqClip {
+    pub id: SeqId,
+    pub track_index: usize,
+    pub start_time_secs: f32,
+    pub duration_secs: f32,
+}
+
+impl SeqClip {
+    pub fn end_time_secs(&self) -> f32 {
+        self.start_time_secs + self.duration_secs
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PadNote {
+    pub id: NoteId,
+    pub seq_id: SeqId,
+    pub slot: u8,
+    /// Seconds from the start of the parent [`SeqClip`].
+    pub start_time_secs: f32,
+    pub duration_secs: f32,
+}
+
+impl PadNote {
+    pub fn end_time_secs(&self) -> f32 {
+        self.start_time_secs + self.duration_secs
+    }
+}
+
 /// Mono samples in f32 [-1, 1] at **device** sample rate.
 #[derive(Clone)]
 pub struct Sample {
@@ -41,11 +79,21 @@ pub struct Clip {
     pub placement_preview: bool,
 }
 
+/// Which edge of a pad region is being dragged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PadEdge {
+    Start,
+    End,
+}
+
 /// Chop on the sampling-instrument waveform, bound to a pad slot `0..16`.
 #[derive(Clone, Copy, Debug)]
 pub struct PadMarker {
     pub slot: u8,
-    pub sample_index: usize,
+    /// Inclusive start in `sample.data`.
+    pub start_index: usize,
+    /// Exclusive end in `sample.data`.
+    pub end_index: usize,
 }
 
 #[derive(Clone)]
@@ -73,6 +121,8 @@ pub struct SamplerPreview {
     pub track_index: usize,
     /// Wall-clock seconds into the sample when a generation bump restarts.
     pub start_secs: f32,
+    /// Stop preview at this local time (`None` = until the buffer ends).
+    pub end_secs: Option<f32>,
 }
 
 impl Default for SamplerPreview {
@@ -82,6 +132,7 @@ impl Default for SamplerPreview {
             generation: 0,
             track_index: 0,
             start_secs: 0.0,
+            end_secs: None,
         }
     }
 }
@@ -131,8 +182,16 @@ pub struct Project {
     pub next_clip_id: u64,
     /// Cue slots 1–9 (`M` to place, number keys to play from).
     pub markers: Vec<CueMarker>,
+    /// Piano-roll notes; times are relative to the parent sequence clip.
+    pub notes: Vec<PadNote>,
+    /// Sequence clips on the timeline (the “колбаски”).
+    pub seq_clips: Vec<SeqClip>,
     /// Explicit studio tracks (sidebar). Clips reference `track_index`.
     pub tracks: Vec<Track>,
+    /// Monotonic source for [`NoteId`].
+    pub next_note_id: u64,
+    /// Monotonic source for [`SeqId`].
+    pub next_seq_id: u64,
     /// Project tempo (BPM). Used by the tempo ruler; 4/4.
     pub tempo_bpm: f32,
     /// Preview inside the sampling instrument (takes over the output while playing).
@@ -148,7 +207,11 @@ impl Project {
             device_sample_rate,
             next_clip_id: 1,
             markers: Vec::new(),
+            notes: Vec::new(),
+            seq_clips: Vec::new(),
             tracks: Vec::new(),
+            next_note_id: 1,
+            next_seq_id: 1,
             tempo_bpm: 120.0,
             sampler_preview: SamplerPreview::default(),
         }
@@ -161,6 +224,32 @@ impl Project {
             self.next_clip_id = 1;
         }
         id
+    }
+
+    pub fn alloc_note_id(&mut self) -> NoteId {
+        let id = NoteId(self.next_note_id);
+        self.next_note_id = self.next_note_id.wrapping_add(1);
+        if self.next_note_id == 0 {
+            self.next_note_id = 1;
+        }
+        id
+    }
+
+    pub fn alloc_seq_id(&mut self) -> SeqId {
+        let id = SeqId(self.next_seq_id);
+        self.next_seq_id = self.next_seq_id.wrapping_add(1);
+        if self.next_seq_id == 0 {
+            self.next_seq_id = 1;
+        }
+        id
+    }
+
+    pub fn note_index(&self, id: NoteId) -> Option<usize> {
+        self.notes.iter().position(|n| n.id == id)
+    }
+
+    pub fn seq_index(&self, id: SeqId) -> Option<usize> {
+        self.seq_clips.iter().position(|s| s.id == id)
     }
 
     pub fn clip_index(&self, id: ClipId) -> Option<usize> {

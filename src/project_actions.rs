@@ -2,10 +2,17 @@
 
 use std::path::Path;
 
-use crate::model::{Clip, ClipId, CueMarker, PadMarker, Project, Sample, Track};
+use crate::model::{
+    Clip, ClipId, CueMarker, NoteId, PadEdge, PadMarker, PadNote, Project, Sample, SeqClip, SeqId,
+    Track,
+};
 use crate::theme::MIN_TRIM_DURATION_SECS;
 use crate::timeline::{TrimDrag, TrimSide};
 use crate::wav_loader;
+
+pub fn default_seq_duration_secs(tempo_bpm: f32) -> f32 {
+    crate::timeline::beat_secs(tempo_bpm) * crate::timeline::BEATS_PER_BAR * 4.0
+}
 
 pub fn add_track(project: &mut Project) -> usize {
     let i = project.tracks.len();
@@ -15,6 +22,14 @@ pub fn add_track(project: &mut Project) -> usize {
         source_tempo_bpm: project.tempo_bpm.clamp(20.0, 400.0),
         pad_markers: Vec::new(),
     });
+    let duration = default_seq_duration_secs(project.tempo_bpm);
+    let id = project.alloc_seq_id();
+    project.seq_clips.push(SeqClip {
+        id,
+        track_index: i,
+        start_time_secs: 0.0,
+        duration_secs: duration,
+    });
     i
 }
 
@@ -22,6 +37,13 @@ pub fn set_track_sample(project: &mut Project, track_index: usize, sample: Sampl
     if let Some(track) = project.tracks.get_mut(track_index) {
         track.pad_markers.clear();
     }
+    let drop_seq: Vec<SeqId> = project
+        .seq_clips
+        .iter()
+        .filter(|s| s.track_index == track_index)
+        .map(|s| s.id)
+        .collect();
+    project.notes.retain(|n| !drop_seq.contains(&n.seq_id));
     let n = sample.data.len();
     if let Some(clip) = project
         .clips
@@ -420,38 +442,72 @@ pub fn delete_marker(project: &mut Project, slot: u8, track_index: usize) -> boo
 }
 
 pub const PAD_SLOT_COUNT: u8 = 16;
+pub const PAD_MIN_SAMPLES: usize = 8;
+
+pub fn pad_min_len(sample_len: usize) -> usize {
+    PAD_MIN_SAMPLES.min(sample_len).max(1)
+}
+
+/// Default chop length: one beat at the track tempo, at least [`PAD_MIN_SAMPLES`].
+pub fn pad_default_len(sample_rate: u32, tempo_bpm: f32) -> usize {
+    let beat = (60.0 / tempo_bpm.clamp(20.0, 400.0) * sample_rate.max(1) as f32).round() as usize;
+    beat.max(PAD_MIN_SAMPLES)
+}
+
+/// Inclusive start / exclusive end for a new pad at `start`.
+pub fn pad_range_from_start(
+    start: usize,
+    sample_len: usize,
+    default_len: usize,
+) -> Option<(usize, usize)> {
+    if sample_len == 0 {
+        return None;
+    }
+    let min_len = pad_min_len(sample_len);
+    let want = default_len.max(min_len).min(sample_len);
+    let s = start.min(sample_len - 1);
+    let e = (s + want).min(sample_len);
+    if e - s >= min_len {
+        return Some((s, e));
+    }
+    let s2 = sample_len.saturating_sub(min_len);
+    Some((s2, sample_len))
+}
 
 pub fn try_place_pad_marker(
     project: &mut Project,
     track_index: usize,
     sample_index: usize,
     sample_len: usize,
+    default_len: usize,
 ) -> Option<u8> {
-    if sample_len == 0 {
-        return None;
-    }
-    let idx = sample_index.min(sample_len - 1);
+    let (start_index, end_index) = pad_range_from_start(sample_index, sample_len, default_len)?;
     let track = project.tracks.get_mut(track_index)?;
     let slot = (0u8..PAD_SLOT_COUNT).find(|&s| !track.pad_markers.iter().any(|m| m.slot == s))?;
     track.pad_markers.push(PadMarker {
         slot,
-        sample_index: idx,
+        start_index,
+        end_index,
     });
     Some(slot)
 }
 
-/// Bind `slot` to `sample_index` only if that pad is still empty.
+/// Bind `slot` to a region starting at `sample_index` only if that pad is still empty.
 pub fn bind_pad_marker(
     project: &mut Project,
     track_index: usize,
     slot: u8,
     sample_index: usize,
     sample_len: usize,
+    default_len: usize,
 ) -> bool {
-    if sample_len == 0 || slot >= PAD_SLOT_COUNT {
+    if slot >= PAD_SLOT_COUNT {
         return false;
     }
-    let idx = sample_index.min(sample_len - 1);
+    let Some((start_index, end_index)) = pad_range_from_start(sample_index, sample_len, default_len)
+    else {
+        return false;
+    };
     let Some(track) = project.tracks.get_mut(track_index) else {
         return false;
     };
@@ -460,32 +516,42 @@ pub fn bind_pad_marker(
     }
     track.pad_markers.push(PadMarker {
         slot,
-        sample_index: idx,
+        start_index,
+        end_index,
     });
     true
 }
 
 pub fn pad_marker_sample(project: &Project, track_index: usize, slot: u8) -> Option<usize> {
+    pad_marker_range(project, track_index, slot).map(|(start, _)| start)
+}
+
+pub fn pad_marker_range(
+    project: &Project,
+    track_index: usize,
+    slot: u8,
+) -> Option<(usize, usize)> {
     project
         .tracks
         .get(track_index)?
         .pad_markers
         .iter()
         .find(|m| m.slot == slot)
-        .map(|m| m.sample_index)
+        .map(|m| (m.start_index, m.end_index))
 }
 
-pub fn move_pad_marker(
+pub fn move_pad_edge(
     project: &mut Project,
     track_index: usize,
     slot: u8,
+    edge: PadEdge,
     sample_index: usize,
     sample_len: usize,
 ) -> bool {
     if sample_len == 0 {
         return false;
     }
-    let idx = sample_index.min(sample_len - 1);
+    let min_len = pad_min_len(sample_len);
     let Some(m) = project
         .tracks
         .get_mut(track_index)
@@ -493,10 +559,24 @@ pub fn move_pad_marker(
     else {
         return false;
     };
-    if m.sample_index == idx {
-        return false;
+    match edge {
+        PadEdge::Start => {
+            let max_start = m.end_index.saturating_sub(min_len);
+            let s = sample_index.min(max_start);
+            if s == m.start_index {
+                return false;
+            }
+            m.start_index = s;
+        }
+        PadEdge::End => {
+            let min_end = (m.start_index + min_len).min(sample_len);
+            let e = sample_index.clamp(min_end, sample_len);
+            if e == m.end_index {
+                return false;
+            }
+            m.end_index = e;
+        }
     }
-    m.sample_index = idx;
     true
 }
 
@@ -506,11 +586,244 @@ pub fn delete_pad_marker(project: &mut Project, track_index: usize, slot: u8) ->
     };
     let n = track.pad_markers.len();
     track.pad_markers.retain(|m| m.slot != slot);
-    track.pad_markers.len() != n
+    if track.pad_markers.len() == n {
+        return false;
+    }
+    let drop_seq: Vec<SeqId> = project
+        .seq_clips
+        .iter()
+        .filter(|s| s.track_index == track_index)
+        .map(|s| s.id)
+        .collect();
+    project
+        .notes
+        .retain(|note| note.slot != slot || !drop_seq.contains(&note.seq_id));
+    true
 }
 
 pub fn sample_index_to_preview_secs(sample_index: usize, sample_rate: u32, speed: f32) -> f32 {
     sample_index as f32 / (sample_rate.max(1) as f32 * speed.max(0.05))
+}
+
+pub fn grid_step_secs(tempo_bpm: f32) -> f32 {
+    crate::timeline::beat_secs(tempo_bpm) / 4.0
+}
+
+pub fn snap_time_floor(time_secs: f32, step: f32) -> f32 {
+    if step <= 1e-6 {
+        return time_secs.max(0.0);
+    }
+    (time_secs.max(0.0) / step).floor() * step
+}
+
+pub fn snap_time_round(time_secs: f32, step: f32) -> f32 {
+    if step <= 1e-6 {
+        return time_secs.max(0.0);
+    }
+    (time_secs.max(0.0) / step).round() * step
+}
+
+pub fn pad_chop_sounding_secs(project: &Project, track_index: usize, slot: u8) -> Option<f32> {
+    let (start, end) = pad_marker_range(project, track_index, slot)?;
+    let speed = project.track_speed(track_index).max(0.05);
+    let rate = project.device_sample_rate.max(1) as f32;
+    Some((end.saturating_sub(start) as f32) / (rate * speed))
+}
+
+fn default_note_duration(project: &Project, track_index: usize, slot: u8) -> f32 {
+    let step = grid_step_secs(project.tempo_bpm).max(1e-4);
+    let chop = pad_chop_sounding_secs(project, track_index, slot).unwrap_or(step);
+    let steps = (chop / step).ceil().max(1.0);
+    steps * step
+}
+
+/// Place a piano-roll note for a bound pad. Duration follows the chop, snapped to 16ths.
+pub fn place_pad_note(
+    project: &mut Project,
+    seq_id: SeqId,
+    slot: u8,
+    start_time_secs: f32,
+) -> Option<NoteId> {
+    if slot >= PAD_SLOT_COUNT {
+        return None;
+    }
+    let seq = *project.seq_clips.iter().find(|s| s.id == seq_id)?;
+    pad_marker_range(project, seq.track_index, slot)?;
+    let step = grid_step_secs(project.tempo_bpm);
+    let start = snap_time_floor(start_time_secs, step).max(0.0);
+    let duration = default_note_duration(project, seq.track_index, slot)
+        .min((seq.duration_secs - start).max(step));
+    if start >= seq.duration_secs {
+        return None;
+    }
+    let id = project.alloc_note_id();
+    project.notes.push(PadNote {
+        id,
+        seq_id,
+        slot,
+        start_time_secs: start,
+        duration_secs: duration,
+    });
+    Some(id)
+}
+
+pub fn move_pad_note(
+    project: &mut Project,
+    id: NoteId,
+    start_time_secs: f32,
+    slot: u8,
+) -> bool {
+    if slot >= PAD_SLOT_COUNT {
+        return false;
+    }
+    let Some(note) = project.notes.iter().find(|n| n.id == id).copied() else {
+        return false;
+    };
+    let Some(seq) = project.seq_clips.iter().find(|s| s.id == note.seq_id).copied() else {
+        return false;
+    };
+    if pad_marker_range(project, seq.track_index, slot).is_none() {
+        return false;
+    }
+    let step = grid_step_secs(project.tempo_bpm);
+    let start = snap_time_round(start_time_secs, step).clamp(0.0, (seq.duration_secs - step).max(0.0));
+    let Some(note) = project.notes.iter_mut().find(|n| n.id == id) else {
+        return false;
+    };
+    if note.start_time_secs == start && note.slot == slot {
+        return false;
+    }
+    note.start_time_secs = start;
+    note.slot = slot;
+    true
+}
+
+pub fn resize_pad_note(project: &mut Project, id: NoteId, end_time_secs: f32) -> bool {
+    let step = grid_step_secs(project.tempo_bpm).max(1e-4);
+    let Some(note) = project.notes.iter().find(|n| n.id == id).copied() else {
+        return false;
+    };
+    let max_end = project
+        .seq_clips
+        .iter()
+        .find(|s| s.id == note.seq_id)
+        .map(|s| s.duration_secs)
+        .unwrap_or(note.end_time_secs());
+    let Some(note) = project.notes.iter_mut().find(|n| n.id == id) else {
+        return false;
+    };
+    let end = snap_time_round(end_time_secs, step)
+        .max(note.start_time_secs + step)
+        .min(max_end);
+    let duration = (end - note.start_time_secs).max(step);
+    if (note.duration_secs - duration).abs() < 1e-6 {
+        return false;
+    }
+    note.duration_secs = duration;
+    true
+}
+
+pub fn delete_pad_note(project: &mut Project, id: NoteId) -> bool {
+    let n = project.notes.len();
+    project.notes.retain(|note| note.id != id);
+    project.notes.len() != n
+}
+
+pub fn seq_clip_on_track(project: &Project, track_index: usize) -> Option<SeqId> {
+    project
+        .seq_clips
+        .iter()
+        .find(|s| s.track_index == track_index)
+        .map(|s| s.id)
+}
+
+pub fn add_seq_clip(
+    project: &mut Project,
+    track_index: usize,
+    start_time_secs: f32,
+) -> Option<SeqId> {
+    if project.tracks.get(track_index).is_none() {
+        return None;
+    }
+    let step = grid_step_secs(project.tempo_bpm);
+    let start = snap_time_floor(start_time_secs, step);
+    let duration = default_seq_duration_secs(project.tempo_bpm);
+    let id = project.alloc_seq_id();
+    project.seq_clips.push(SeqClip {
+        id,
+        track_index,
+        start_time_secs: start,
+        duration_secs: duration,
+    });
+    Some(id)
+}
+
+pub fn move_seq_clip(project: &mut Project, id: SeqId, start_time_secs: f32) -> bool {
+    let step = grid_step_secs(project.tempo_bpm);
+    let start = snap_time_round(start_time_secs, step).max(0.0);
+    let Some(seq) = project.seq_clips.iter_mut().find(|s| s.id == id) else {
+        return false;
+    };
+    if (seq.start_time_secs - start).abs() < 1e-6 {
+        return false;
+    }
+    seq.start_time_secs = start;
+    true
+}
+
+pub fn resize_seq_end(project: &mut Project, id: SeqId, end_time_secs: f32) -> bool {
+    let step = grid_step_secs(project.tempo_bpm).max(1e-4);
+    let Some(seq) = project.seq_clips.iter_mut().find(|s| s.id == id) else {
+        return false;
+    };
+    let end = snap_time_round(end_time_secs, step).max(seq.start_time_secs + step);
+    let duration = (end - seq.start_time_secs).max(step);
+    if (seq.duration_secs - duration).abs() < 1e-6 {
+        return false;
+    }
+    seq.duration_secs = duration;
+    true
+}
+
+pub fn resize_seq_start(project: &mut Project, id: SeqId, start_time_secs: f32) -> bool {
+    let step = grid_step_secs(project.tempo_bpm).max(1e-4);
+    let Some(seq) = project.seq_clips.iter().find(|s| s.id == id).copied() else {
+        return false;
+    };
+    let end = seq.end_time_secs();
+    let start = snap_time_round(start_time_secs, step)
+        .max(0.0)
+        .min(end - step);
+    let delta = start - seq.start_time_secs;
+    if delta.abs() < 1e-6 {
+        return false;
+    }
+    let Some(seq) = project.seq_clips.iter_mut().find(|s| s.id == id) else {
+        return false;
+    };
+    seq.start_time_secs = start;
+    seq.duration_secs = (end - start).max(step);
+    for note in project.notes.iter_mut().filter(|n| n.seq_id == id) {
+        note.start_time_secs -= delta;
+    }
+    project.notes.retain(|n| n.seq_id != id || n.end_time_secs() > 0.0);
+    for note in project.notes.iter_mut().filter(|n| n.seq_id == id) {
+        if note.start_time_secs < 0.0 {
+            note.duration_secs += note.start_time_secs;
+            note.start_time_secs = 0.0;
+        }
+    }
+    true
+}
+
+pub fn delete_seq_clip(project: &mut Project, id: SeqId) -> bool {
+    let n = project.seq_clips.len();
+    project.seq_clips.retain(|s| s.id != id);
+    if project.seq_clips.len() == n {
+        return false;
+    }
+    project.notes.retain(|note| note.seq_id != id);
+    true
 }
 
 #[cfg(test)]
@@ -572,15 +885,20 @@ mod tests {
         let i = add_track(&mut p);
         set_track_sample(&mut p, i, dummy_sample(), "a".into());
         for s in 0u8..16 {
-            assert_eq!(try_place_pad_marker(&mut p, i, s as usize, 64), Some(s));
+            assert_eq!(try_place_pad_marker(&mut p, i, s as usize, 64, 8), Some(s));
         }
-        assert_eq!(try_place_pad_marker(&mut p, i, 99, 64), None);
-        assert_eq!(pad_marker_sample(&p, i, 3), Some(3));
-        assert!(move_pad_marker(&mut p, i, 3, 10, 64));
-        assert_eq!(pad_marker_sample(&p, i, 3), Some(10));
+        assert_eq!(try_place_pad_marker(&mut p, i, 99, 64, 8), None);
+        assert_eq!(pad_marker_range(&p, i, 3), Some((3, 11)));
+        assert!(move_pad_edge(&mut p, i, 3, PadEdge::End, 20, 64));
+        assert_eq!(pad_marker_range(&p, i, 3), Some((3, 20)));
+        assert!(move_pad_edge(&mut p, i, 3, PadEdge::Start, 10, 64));
+        assert_eq!(pad_marker_range(&p, i, 3), Some((10, 20)));
+        assert!(move_pad_edge(&mut p, i, 3, PadEdge::Start, 18, 64));
+        assert_eq!(pad_marker_range(&p, i, 3), Some((12, 20)));
+        assert!(!move_pad_edge(&mut p, i, 3, PadEdge::Start, 18, 64));
         assert!(delete_pad_marker(&mut p, i, 3));
         assert_eq!(pad_marker_sample(&p, i, 3), None);
-        assert_eq!(try_place_pad_marker(&mut p, i, 0, 64), Some(3));
+        assert_eq!(try_place_pad_marker(&mut p, i, 0, 64, 8), Some(3));
     }
 
     #[test]
@@ -588,12 +906,12 @@ mod tests {
         let mut p = Project::empty(48_000);
         let i = add_track(&mut p);
         set_track_sample(&mut p, i, dummy_sample(), "a".into());
-        assert!(bind_pad_marker(&mut p, i, 8, 12, 64));
-        assert_eq!(pad_marker_sample(&p, i, 8), Some(12));
-        assert!(!bind_pad_marker(&mut p, i, 8, 20, 64));
-        assert_eq!(pad_marker_sample(&p, i, 8), Some(12));
-        assert!(bind_pad_marker(&mut p, i, 0, 1, 64));
-        assert_eq!(pad_marker_sample(&p, i, 0), Some(1));
+        assert!(bind_pad_marker(&mut p, i, 8, 12, 64, 8));
+        assert_eq!(pad_marker_range(&p, i, 8), Some((12, 20)));
+        assert!(!bind_pad_marker(&mut p, i, 8, 20, 64, 8));
+        assert_eq!(pad_marker_range(&p, i, 8), Some((12, 20)));
+        assert!(bind_pad_marker(&mut p, i, 0, 1, 64, 8));
+        assert_eq!(pad_marker_range(&p, i, 0), Some((1, 9)));
     }
 
     #[test]
@@ -601,8 +919,60 @@ mod tests {
         let mut p = Project::empty(48_000);
         let i = add_track(&mut p);
         set_track_sample(&mut p, i, dummy_sample(), "a".into());
-        assert_eq!(try_place_pad_marker(&mut p, i, 4, 64), Some(0));
+        assert_eq!(try_place_pad_marker(&mut p, i, 4, 64, 8), Some(0));
+        let seq = seq_clip_on_track(&p, i).unwrap();
+        assert!(place_pad_note(&mut p, seq, 0, 0.0).is_some());
+        assert_eq!(p.notes.len(), 1);
         set_track_sample(&mut p, i, dummy_sample(), "b".into());
         assert!(p.tracks[i].pad_markers.is_empty());
+        assert!(p.notes.is_empty());
+    }
+
+    #[test]
+    fn piano_roll_note_requires_bound_pad() {
+        let mut p = Project::empty(48_000);
+        p.tempo_bpm = 120.0;
+        let i = add_track(&mut p);
+        set_track_sample(&mut p, i, dummy_sample(), "a".into());
+        let seq = seq_clip_on_track(&p, i).unwrap();
+        assert!(place_pad_note(&mut p, seq, 0, 0.25).is_none());
+        assert!(bind_pad_marker(&mut p, i, 0, 0, 64, 8));
+        let id = place_pad_note(&mut p, seq, 0, 0.25).unwrap();
+        let n = p.notes.iter().find(|n| n.id == id).unwrap();
+        assert_eq!(n.slot, 0);
+        assert_eq!(n.seq_id, seq);
+        assert!(n.duration_secs > 0.0);
+        assert!(move_pad_note(&mut p, id, 1.0, 0));
+        assert!(resize_pad_note(&mut p, id, 2.0));
+        assert!(delete_pad_note(&mut p, id));
+        assert!(p.notes.is_empty());
+    }
+
+    #[test]
+    fn seq_clip_move_resize_delete() {
+        let mut p = Project::empty(48_000);
+        p.tempo_bpm = 120.0;
+        let i = add_track(&mut p);
+        set_track_sample(&mut p, i, dummy_sample(), "a".into());
+        assert!(bind_pad_marker(&mut p, i, 0, 0, 64, 8));
+        let seq = seq_clip_on_track(&p, i).unwrap();
+        let id = place_pad_note(&mut p, seq, 0, 0.5).unwrap();
+        let note_start = p.notes.iter().find(|n| n.id == id).unwrap().start_time_secs;
+        assert!(move_seq_clip(&mut p, seq, 1.0));
+        assert!((p.seq_clips[0].start_time_secs - 1.0).abs() < 1e-4);
+        assert!(
+            (p.notes.iter().find(|n| n.id == id).unwrap().start_time_secs - note_start).abs()
+                < 1e-4
+        );
+        let end = p.seq_clips[0].end_time_secs();
+        assert!(resize_seq_end(&mut p, seq, end - 0.5));
+        assert!(p.seq_clips[0].duration_secs < end - 1.0 + 0.6);
+        let start = p.seq_clips[0].start_time_secs;
+        assert!(resize_seq_start(&mut p, seq, start + 0.25));
+        let shifted = p.notes.iter().find(|n| n.id == id).unwrap().start_time_secs;
+        assert!((shifted - (note_start - 0.25)).abs() < 1e-3);
+        assert!(delete_seq_clip(&mut p, seq));
+        assert!(p.seq_clips.is_empty());
+        assert!(p.notes.is_empty());
     }
 }

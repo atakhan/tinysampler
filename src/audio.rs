@@ -123,25 +123,10 @@ fn start_stream(
 
                 let rate = sample_rate as f32;
                 let n = data.len() / channels;
-                let previewing = proj.sampler_preview.playing;
+                let mix_preview = proj.sampler_preview.playing;
+                let mix_song = proj.transport.is_playing;
 
-                if previewing {
-                    let base = preview_secs;
-                    for i in 0..n {
-                        let t = base + i as f32 / rate;
-                        let v = mix::mix_sampler_preview_at(proj, t);
-                        let frame = i * channels;
-                        for c in 0..channels {
-                            data[frame + c] = v;
-                        }
-                    }
-                    preview_secs += n as f32 / rate;
-                    preview_secs_bits.store(preview_secs.to_bits(), Ordering::Relaxed);
-                    playhead_secs_bits.store(playhead_secs.to_bits(), Ordering::Relaxed);
-                    return;
-                }
-
-                if !proj.transport.is_playing {
+                if !mix_preview && !mix_song {
                     for o in data.iter_mut() {
                         *o = 0.0;
                     }
@@ -154,17 +139,35 @@ fn start_stream(
                     return;
                 }
 
-                let base = playhead_secs;
+                let preview_base = preview_secs;
+                let song_base = playhead_secs;
                 for i in 0..n {
-                    let t = base + i as f32 / rate;
-                    let v = mix::mix_mono_sample_at(proj, t);
+                    let mut v = 0.0f32;
+                    if mix_preview {
+                        v += mix::mix_sampler_preview_at(proj, preview_base + i as f32 / rate);
+                    }
+                    if mix_song {
+                        v += mix::mix_mono_sample_at(proj, song_base + i as f32 / rate);
+                    }
+                    v = v.clamp(-1.0, 1.0);
                     let frame = i * channels;
                     for c in 0..channels {
                         data[frame + c] = v;
                     }
                 }
 
-                playhead_secs += n as f32 / rate;
+                if mix_preview {
+                    preview_secs += n as f32 / rate;
+                    preview_secs_bits.store(preview_secs.to_bits(), Ordering::Relaxed);
+                } else {
+                    preview_secs = f32::from_bits(preview_secs_bits.load(Ordering::Relaxed));
+                    if !preview_secs.is_finite() {
+                        preview_secs = 0.0;
+                    }
+                }
+                if mix_song {
+                    playhead_secs += n as f32 / rate;
+                }
                 playhead_secs_bits.store(playhead_secs.to_bits(), Ordering::Relaxed);
             },
             move |e| {

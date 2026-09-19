@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Clip, ClipId, CueMarker, PadMarker, Project, Track};
+use crate::model::{Clip, ClipId, CueMarker, NoteId, PadMarker, PadNote, Project, SeqClip, SeqId, Track};
+use crate::project_actions::{pad_default_len, pad_range_from_start};
 use crate::wav_loader;
 use crate::waveform::PeakPyramid;
 
@@ -47,6 +48,14 @@ struct ProjectFile {
     tracks: Vec<TrackFile>,
     clips: Vec<ClipFile>,
     markers: Vec<MarkerFile>,
+    #[serde(default)]
+    notes: Vec<NoteFile>,
+    #[serde(default)]
+    seq_clips: Vec<SeqClipFile>,
+    #[serde(default)]
+    next_note_id: u64,
+    #[serde(default)]
+    next_seq_id: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -61,7 +70,12 @@ struct TrackFile {
 #[derive(Serialize, Deserialize)]
 struct PadMarkerFile {
     slot: u8,
-    sample_index: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sample_index: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    start_index: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    end_index: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -81,6 +95,26 @@ struct MarkerFile {
     slot: u8,
     time_secs: f32,
     track_index: usize,
+}
+
+#[derive(Serialize, Deserialize)]
+struct NoteFile {
+    id: u64,
+    #[serde(default)]
+    seq_id: Option<u64>,
+    #[serde(default)]
+    track_index: Option<usize>,
+    slot: u8,
+    start_time_secs: f32,
+    duration_secs: f32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SeqClipFile {
+    id: u64,
+    track_index: usize,
+    start_time_secs: f32,
+    duration_secs: f32,
 }
 
 pub fn default_root() -> PathBuf {
@@ -199,6 +233,8 @@ pub fn save_project(root: &Path, entry: &mut DiskProject) -> Result<(), String> 
         pcm_sample_rate: pcm_rate,
         tempo_bpm: entry.project.tempo_bpm,
         next_clip_id: entry.project.next_clip_id,
+        next_note_id: entry.project.next_note_id,
+        next_seq_id: entry.project.next_seq_id,
         tracks: entry
             .project
             .tracks
@@ -212,7 +248,9 @@ pub fn save_project(root: &Path, entry: &mut DiskProject) -> Result<(), String> 
                     .iter()
                     .map(|m| PadMarkerFile {
                         slot: m.slot,
-                        sample_index: m.sample_index,
+                        sample_index: None,
+                        start_index: Some(m.start_index),
+                        end_index: Some(m.end_index),
                     })
                     .collect(),
             })
@@ -240,6 +278,30 @@ pub fn save_project(root: &Path, entry: &mut DiskProject) -> Result<(), String> 
                 slot: m.slot,
                 time_secs: m.time_secs,
                 track_index: m.track_index,
+            })
+            .collect(),
+        notes: entry
+            .project
+            .notes
+            .iter()
+            .map(|n| NoteFile {
+                id: n.id.0,
+                seq_id: Some(n.seq_id.0),
+                track_index: None,
+                slot: n.slot,
+                start_time_secs: n.start_time_secs,
+                duration_secs: n.duration_secs,
+            })
+            .collect(),
+        seq_clips: entry
+            .project
+            .seq_clips
+            .iter()
+            .map(|s| SeqClipFile {
+                id: s.id.0,
+                track_index: s.track_index,
+                start_time_secs: s.start_time_secs,
+                duration_secs: s.duration_secs,
             })
             .collect(),
     };
@@ -333,6 +395,7 @@ pub fn load_project(root: &Path, id: u64, device_sample_rate: u32) -> Result<Dis
                 .unwrap_or(0);
             let max_i = n.saturating_sub(1);
             let mut seen = [false; 16];
+            let default_len = pad_default_len(dst_rate, t.source_tempo_bpm);
             let pad_markers = if n == 0 {
                 Vec::new()
             } else {
@@ -343,10 +406,23 @@ pub fn load_project(root: &Path, id: u64, device_sample_rate: u32) -> Result<Dis
                         if i >= 16 || seen[i] {
                             return None;
                         }
+                        let start_raw = m.start_index.or(m.sample_index)?;
+                        let start = scale_index(start_raw, src_rate, dst_rate, max_i);
+                        let end = if let Some(end_raw) = m.end_index {
+                            scale_index(end_raw, src_rate, dst_rate, n)
+                        } else {
+                            pad_range_from_start(start, n, default_len)?.1
+                        };
+                        let end = if end <= start {
+                            pad_range_from_start(start, n, default_len)?.1
+                        } else {
+                            end
+                        };
                         seen[i] = true;
                         Some(PadMarker {
                             slot: m.slot,
-                            sample_index: scale_index(m.sample_index, src_rate, dst_rate, max_i),
+                            start_index: start,
+                            end_index: end,
                         })
                     })
                     .collect()
@@ -359,6 +435,130 @@ pub fn load_project(root: &Path, id: u64, device_sample_rate: u32) -> Result<Dis
             }
         })
         .collect();
+
+    let n_tracks = tracks.len();
+    let mut next_seq_id = file.next_seq_id.max(1);
+    let mut seen_seq = HashSet::new();
+    let mut seq_clips: Vec<SeqClip> = Vec::new();
+    for s in file.seq_clips {
+        if s.track_index >= n_tracks || s.duration_secs <= 0.0 {
+            continue;
+        }
+        let id = if s.id == 0 {
+            let id = next_seq_id;
+            next_seq_id = next_seq_id.saturating_add(1).max(1);
+            id
+        } else {
+            if !seen_seq.insert(s.id) {
+                continue;
+            }
+            next_seq_id = next_seq_id.max(s.id.saturating_add(1));
+            s.id
+        };
+        seq_clips.push(SeqClip {
+            id: SeqId(id),
+            track_index: s.track_index,
+            start_time_secs: s.start_time_secs.max(0.0),
+            duration_secs: s.duration_secs,
+        });
+    }
+
+    let mut seen_note_ids = HashSet::new();
+    let mut notes: Vec<PadNote> = Vec::new();
+    let mut orphan_by_track: Vec<(usize, NoteFile)> = Vec::new();
+    for n in file.notes {
+        if n.slot >= 16 || n.duration_secs <= 0.0 {
+            continue;
+        }
+        if n.id != 0 && !seen_note_ids.insert(n.id) {
+            continue;
+        }
+        if let Some(seq_id) = n.seq_id {
+            if seq_clips.iter().any(|s| s.id.0 == seq_id) {
+                notes.push(PadNote {
+                    id: NoteId(n.id),
+                    seq_id: SeqId(seq_id),
+                    slot: n.slot,
+                    start_time_secs: n.start_time_secs.max(0.0),
+                    duration_secs: n.duration_secs,
+                });
+                continue;
+            }
+        }
+        if let Some(track_index) = n.track_index {
+            if track_index < n_tracks {
+                orphan_by_track.push((track_index, n));
+            }
+        }
+    }
+
+    if seq_clips.is_empty() {
+        let default_dur = crate::project_actions::default_seq_duration_secs(file.tempo_bpm);
+        for ti in 0..n_tracks {
+            let related: Vec<&NoteFile> = orphan_by_track
+                .iter()
+                .filter(|(t, _)| *t == ti)
+                .map(|(_, n)| n)
+                .collect();
+            let start = related
+                .iter()
+                .map(|n| n.start_time_secs.max(0.0))
+                .fold(f32::INFINITY, f32::min);
+            let start = if start.is_finite() { start } else { 0.0 };
+            let end = related
+                .iter()
+                .map(|n| n.start_time_secs.max(0.0) + n.duration_secs)
+                .fold(start + default_dur, f32::max);
+            let id = next_seq_id;
+            next_seq_id = next_seq_id.saturating_add(1).max(1);
+            seq_clips.push(SeqClip {
+                id: SeqId(id),
+                track_index: ti,
+                start_time_secs: start,
+                duration_secs: (end - start).max(default_dur),
+            });
+        }
+    } else {
+        for ti in 0..n_tracks {
+            if seq_clips.iter().any(|s| s.track_index == ti) {
+                continue;
+            }
+            let id = next_seq_id;
+            next_seq_id = next_seq_id.saturating_add(1).max(1);
+            seq_clips.push(SeqClip {
+                id: SeqId(id),
+                track_index: ti,
+                start_time_secs: 0.0,
+                duration_secs: crate::project_actions::default_seq_duration_secs(file.tempo_bpm),
+            });
+        }
+    }
+
+    for (track_index, n) in orphan_by_track {
+        let Some(seq) = seq_clips.iter().find(|s| s.track_index == track_index) else {
+            continue;
+        };
+        let local = (n.start_time_secs - seq.start_time_secs).max(0.0);
+        notes.push(PadNote {
+            id: NoteId(n.id),
+            seq_id: seq.id,
+            slot: n.slot,
+            start_time_secs: local,
+            duration_secs: n.duration_secs,
+        });
+    }
+
+    let mut next_note_id = file.next_note_id.max(1);
+    for note in &notes {
+        next_note_id = next_note_id.max(note.id.0.saturating_add(1));
+    }
+    for note in &mut notes {
+        if note.id.0 == 0 {
+            let id = next_note_id;
+            next_note_id = next_note_id.saturating_add(1).max(1);
+            note.id = NoteId(id);
+        }
+    }
 
     let project = Project {
         name: file.name,
@@ -376,6 +576,10 @@ pub fn load_project(root: &Path, id: u64, device_sample_rate: u32) -> Result<Dis
             })
             .collect(),
         tracks,
+        notes,
+        seq_clips,
+        next_note_id,
+        next_seq_id,
         tempo_bpm: file.tempo_bpm.clamp(20.0, 400.0),
         sampler_preview: crate::model::SamplerPreview::default(),
     };
@@ -482,9 +686,11 @@ mod tests {
         project.clips[1].start_time_secs = 1.5;
         project_actions::try_place_marker(&mut project, 0.5, 0);
         assert_eq!(
-            project_actions::try_place_pad_marker(&mut project, t0, 7, 32),
+            project_actions::try_place_pad_marker(&mut project, t0, 7, 32, 8),
             Some(0)
         );
+        let seq0 = project_actions::seq_clip_on_track(&project, t0).unwrap();
+        assert!(project_actions::place_pad_note(&mut project, seq0, 0, 0.5).is_some());
 
         let mut entry = DiskProject::new(7, project);
         save_project(&root, &mut entry).unwrap();
@@ -511,9 +717,31 @@ mod tests {
         assert_eq!(loaded.clips[1].start_time_secs, 1.5);
         assert_eq!(loaded.markers.len(), 1);
         assert_eq!(loaded.tracks[0].pad_markers.len(), 1);
-        assert_eq!(loaded.tracks[0].pad_markers[0].sample_index, 7);
+        assert_eq!(loaded.tracks[0].pad_markers[0].start_index, 7);
+        assert_eq!(loaded.tracks[0].pad_markers[0].end_index, 15);
+        assert_eq!(loaded.notes.len(), 1);
+        assert_eq!(loaded.notes[0].slot, 0);
+        assert_eq!(loaded.seq_clips.len(), 2);
+        assert_eq!(
+            loaded.notes[0].seq_id,
+            loaded.seq_clips.iter().find(|s| s.track_index == 0).unwrap().id
+        );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pad_marker_file_accepts_legacy_sample_index() {
+        let m: PadMarkerFile = serde_json::from_str(r#"{"slot":2,"sample_index":9}"#).unwrap();
+        assert_eq!(m.slot, 2);
+        assert_eq!(m.sample_index, Some(9));
+        assert_eq!(m.start_index, None);
+        assert_eq!(m.end_index, None);
+        let m: PadMarkerFile =
+            serde_json::from_str(r#"{"slot":1,"start_index":4,"end_index":20}"#).unwrap();
+        assert_eq!(m.start_index, Some(4));
+        assert_eq!(m.end_index, Some(20));
+        assert_eq!(m.sample_index, None);
     }
 
     #[test]

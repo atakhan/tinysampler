@@ -6,6 +6,7 @@ mod library;
 mod mix;
 mod model;
 mod persist;
+mod pianoroll;
 mod project_actions;
 mod sampler;
 mod theme;

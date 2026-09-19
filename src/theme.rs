@@ -34,6 +34,9 @@ pub const TRANSPORT_BTN_GAP: f32 = 24.0;
 /// Reserve under the buttons for a possible error line.
 pub const TRANSPORT_RESERVE_H: f32 = 40.0;
 
+pub const PIANO_KEY_COUNT: usize = 16;
+pub const PIANO_KEY_W: f32 = 32.0;
+pub const PIANO_KEY_MIN_H: f32 = 14.0;
 pub const TIMELINE_TRACK_HEIGHT: f32 = 160.0;
 
 pub const STUDIO_TOP_BAR_H: f32 = 52.0;
@@ -160,4 +163,32 @@ pub fn color_pad_selected() -> Color32 {
 
 pub fn color_pad_held() -> Color32 {
     Color32::from_rgb(52, 140, 92)
+}
+
+pub fn color_piano_key() -> Color32 {
+    Color32::from_rgb(48, 48, 56)
+}
+
+pub fn color_piano_key_alt() -> Color32 {
+    Color32::from_rgb(38, 38, 46)
+}
+
+pub fn color_piano_key_bound() -> Color32 {
+    Color32::from_rgb(62, 78, 118)
+}
+
+pub fn color_piano_grid_beat() -> Color32 {
+    Color32::from_rgba_unmultiplied(255, 255, 255, 28)
+}
+
+pub fn color_piano_grid_step() -> Color32 {
+    Color32::from_rgba_unmultiplied(255, 255, 255, 12)
+}
+
+pub fn color_piano_note() -> Color32 {
+    Color32::from_rgb(186, 190, 236)
+}
+
+pub fn color_piano_note_selected() -> Color32 {
+    Color32::from_rgb(220, 224, 255)
 }
