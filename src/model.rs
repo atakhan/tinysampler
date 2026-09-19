@@ -41,6 +41,39 @@ pub struct Clip {
     pub placement_preview: bool,
 }
 
+#[derive(Clone)]
+pub struct Track {
+    pub name: String,
+    /// Classic-sampler pitch: playback speed `2^(n/12)`.
+    pub pitch_semitones: i32,
+    /// Tempo assigned in the sampling instrument (4/4 grid); 20–400 BPM.
+    pub source_tempo_bpm: f32,
+}
+
+impl Track {
+    pub fn playback_speed(&self) -> f32 {
+        2f32.powf(self.pitch_semitones as f32 / 12.0)
+    }
+}
+
+#[derive(Clone)]
+pub struct SamplerPreview {
+    pub playing: bool,
+    /// Bumped to restart preview from the beginning.
+    pub generation: u64,
+    pub track_index: usize,
+}
+
+impl Default for SamplerPreview {
+    fn default() -> Self {
+        Self {
+            playing: false,
+            generation: 0,
+            track_index: 0,
+        }
+    }
+}
+
 impl Clip {
     pub fn visible_sample_len(&self) -> usize {
         self.trim_end.saturating_sub(self.trim_start)
@@ -78,6 +111,7 @@ pub struct CueMarker {
 
 #[derive(Clone)]
 pub struct Project {
+    pub name: String,
     pub clips: Vec<Clip>,
     pub transport: Transport,
     pub device_sample_rate: u32,
@@ -85,19 +119,26 @@ pub struct Project {
     pub next_clip_id: u64,
     /// Cue slots 1–9 (`M` to place, number keys to play from).
     pub markers: Vec<CueMarker>,
+    /// Explicit studio tracks (sidebar). Clips reference `track_index`.
+    pub tracks: Vec<Track>,
     /// Project tempo (BPM). Used by the tempo ruler; 4/4.
     pub tempo_bpm: f32,
+    /// Preview inside the sampling instrument (takes over the output while playing).
+    pub sampler_preview: SamplerPreview,
 }
 
 impl Project {
     pub fn empty(device_sample_rate: u32) -> Self {
         Self {
+            name: "Проект".into(),
             clips: Vec::new(),
             transport: Transport::default(),
             device_sample_rate,
             next_clip_id: 1,
             markers: Vec::new(),
+            tracks: Vec::new(),
             tempo_bpm: 120.0,
+            sampler_preview: SamplerPreview::default(),
         }
     }
 
@@ -114,23 +155,35 @@ impl Project {
         self.clips.iter().position(|c| c.id == id)
     }
 
-    /// Number of lanes to draw (at least one).
+    /// Number of studio tracks.
     pub fn track_count(&self) -> usize {
-        self.clips
-            .iter()
-            .map(|c| c.track_index)
-            .max()
-            .map(|m| m + 1)
-            .unwrap_or(1)
+        self.tracks.len()
     }
 
-    /// Lane for the next imported file (0, then 1, then 2, …).
+    /// Index for a newly created track.
+    #[allow(dead_code)]
     pub fn next_track_index(&self) -> usize {
-        self.clips
-            .iter()
-            .map(|c| c.track_index)
-            .max()
-            .map(|m| m + 1)
-            .unwrap_or(0)
+        self.tracks.len()
+    }
+
+    pub fn track_speed(&self, track_index: usize) -> f32 {
+        self.tracks
+            .get(track_index)
+            .map(Track::playback_speed)
+            .unwrap_or(1.0)
+    }
+
+    #[allow(dead_code)]
+    pub fn clip_sounding_secs(&self, clip: &Clip) -> f32 {
+        clip.timeline_duration_secs(self.device_sample_rate)
+            / self.track_speed(clip.track_index).max(0.05)
+    }
+
+    pub fn clip_sounding_secs_at(&self, idx: usize) -> f32 {
+        let (raw, ti) = match self.clips.get(idx) {
+            Some(c) => (c.timeline_duration_secs(self.device_sample_rate), c.track_index),
+            None => return 0.0,
+        };
+        raw / self.track_speed(ti).max(0.05)
     }
 }

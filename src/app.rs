@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use egui::{Color32, CursorIcon, Key, Pos2, Rect, Stroke, Vec2};
@@ -11,9 +12,12 @@ use crate::model::{ClipId, Project, Sample};
 use crate::project_actions;
 use crate::theme;
 use crate::timeline::{self, TrimDrag};
-use crate::waveform::PeakPyramid;
+use crate::waveform;
 
 use crate::audio;
+use crate::library;
+use crate::persist::{self, DiskProject};
+use crate::sampler;
 
 #[derive(Clone)]
 struct ClipSettleAnim {
@@ -21,6 +25,12 @@ struct ClipSettleAnim {
     from_secs: f32,
     to_secs: f32,
     t0: f64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AppScreen {
+    Library,
+    Studio,
 }
 
 pub struct TinySamplerApp {
@@ -46,7 +56,19 @@ pub struct TinySamplerApp {
     selected_marker: Option<(u8, usize)>,
     marker_drag: Option<(u8, usize)>,
     selected_track: usize,
-    ruler_kind: timeline::RulerKind,
+    screen: AppScreen,
+    library: Vec<DiskProject>,
+    open_project_id: Option<u64>,
+    next_project_id: u64,
+    sampler_track: Option<usize>,
+    sampler_view_start: f32,
+    sampler_view_len: f32,
+    persist_root: PathBuf,
+    dirty: bool,
+    last_persist: Instant,
+    /// Wait this many frames after show, then send a single Maximized(true).
+    /// Must not maximize at HWND creation — see comment in `main`.
+    startup_maximize_after: u8,
 }
 
 impl TinySamplerApp {
@@ -62,6 +84,18 @@ impl TinySamplerApp {
             Arc::clone(&seek_target_secs_bits),
         )?;
 
+        let persist_root = persist::default_root();
+        if let Err(e) = persist::ensure_root(&persist_root) {
+            eprintln!("persist dir: {e}");
+        }
+        let device_rate = project_swap.load().device_sample_rate;
+        let (library, next_project_id, load_err) =
+            persist::load_library(&persist_root, device_rate);
+        let mut status = String::new();
+        if let Some(e) = load_err {
+            status = format!("Загрузка проектов: {e}");
+        }
+
         let mut style = (*cc.egui_ctx.style()).clone();
         style.visuals.dark_mode = true;
         cc.egui_ctx.set_style(style);
@@ -73,7 +107,7 @@ impl TinySamplerApp {
             seek_target_secs_bits,
             engine,
             pixels_per_second: 120.0,
-            status: String::new(),
+            status,
             timeline_scroll_px: 0.0,
             selected_clip_id: None,
             trim_drag: None,
@@ -86,12 +120,25 @@ impl TinySamplerApp {
             selected_marker: None,
             marker_drag: None,
             selected_track: 0,
-            ruler_kind: timeline::RulerKind::Time,
+            screen: AppScreen::Library,
+            library,
+            open_project_id: None,
+            next_project_id,
+            sampler_track: None,
+            sampler_view_start: 0.0,
+            sampler_view_len: 1.0,
+            persist_root,
+            dirty: false,
+            last_persist: Instant::now(),
+            startup_maximize_after: 2,
         })
     }
 
     fn publish(&mut self, project: Project) {
         self.project_swap.store(Arc::new(project));
+        if self.screen == AppScreen::Studio {
+            self.dirty = true;
+        }
     }
 
     fn current_project(&self) -> Arc<Project> {
@@ -266,6 +313,10 @@ impl TinySamplerApp {
     }
 
     fn poll_dropped_files(&mut self, ctx: &egui::Context) {
+        if self.screen != AppScreen::Studio || self.sampler_track.is_none() {
+            ctx.input_mut(|i| i.raw.dropped_files.clear());
+            return;
+        }
         let hovered = ctx.input(|i| !i.raw.hovered_files.is_empty());
         const DROP_HINT: &str = "Отпустите WAV или MP3, чтобы загрузить";
         if hovered {
@@ -306,9 +357,30 @@ impl TinySamplerApp {
         match outcome {
             Some(Ok((sample, label))) => {
                 let mut p = (*self.current_project()).clone();
-                let track = project_actions::append_audio_clip(&mut p, sample, label.clone());
-                self.status = format!("{label} → дорожка {}", track + 1);
-                self.publish(p);
+                let track = self
+                    .sampler_track
+                    .or_else(|| {
+                        if p.tracks.is_empty() {
+                            None
+                        } else {
+                            Some(self.selected_track.min(p.tracks.len().saturating_sub(1)))
+                        }
+                    });
+                if let Some(track) = track {
+                    project_actions::set_track_sample(&mut p, track, sample, label.clone());
+                    let n = p
+                        .clips
+                        .iter()
+                        .find(|c| c.track_index == track)
+                        .map(|c| c.sample.data.len() as f32)
+                        .unwrap_or(1.0);
+                    self.sampler_view_start = 0.0;
+                    self.sampler_view_len = n.max(1.0);
+                    self.status = format!("{label} → {}", p.tracks[track].name);
+                    self.publish(p);
+                } else {
+                    self.status = "Сначала добавьте трек в студии.".into();
+                }
             }
             Some(Err(e)) => self.status = e,
             None => self.status = "Загрузка прервалась.".into(),
@@ -363,7 +435,30 @@ impl TinySamplerApp {
         if ctx.wants_keyboard_input() {
             return;
         }
-        let (ctrl_space, space, open_wav, split_playhead, delete_clip, place_marker, play_marker_slot) =
+        if self.screen != AppScreen::Studio {
+            return;
+        }
+        if self.sampler_track.is_some() {
+            let (space, open_wav, escape, save) = ctx.input(|i| {
+                (
+                    i.key_pressed(Key::Space) && !i.modifiers.ctrl,
+                    i.key_pressed(Key::O) && (i.modifiers.ctrl || i.modifiers.command),
+                    i.key_pressed(Key::Escape),
+                    i.key_pressed(Key::S) && (i.modifiers.ctrl || i.modifiers.command),
+                )
+            });
+            if escape {
+                self.close_sampler();
+            } else if space {
+                self.sampler_toggle_preview();
+            } else if open_wav {
+                self.try_pick_and_load_audio();
+            } else if save {
+                self.persist_now(true);
+            }
+            return;
+        }
+        let (ctrl_space, space, open_wav, split_playhead, delete_clip, place_marker, play_marker_slot, save) =
             ctx.input(|i| {
                 let mods = i.modifiers.ctrl || i.modifiers.command || i.modifiers.alt;
                 let space = i.key_pressed(Key::Space);
@@ -372,6 +467,7 @@ impl TinySamplerApp {
                     i.key_pressed(Key::K) && (i.modifiers.ctrl || i.modifiers.command);
                 let delete_clip = i.key_pressed(Key::Delete);
                 let place_marker = i.key_pressed(Key::M) && !mods;
+                let save = i.key_pressed(Key::S) && (i.modifiers.ctrl || i.modifiers.command);
                 let play_marker_slot = if mods {
                     None
                 } else {
@@ -385,6 +481,7 @@ impl TinySamplerApp {
                     delete_clip,
                     place_marker,
                     play_marker_slot,
+                    save,
                 )
             });
         if ctrl_space {
@@ -393,6 +490,8 @@ impl TinySamplerApp {
             self.transport_toggle_play_pause();
         } else if open_wav {
             self.try_pick_and_load_audio();
+        } else if save {
+            self.persist_now(true);
         } else if split_playhead {
             self.try_split_clip_at_playhead();
         } else if delete_clip {
@@ -463,6 +562,231 @@ impl TinySamplerApp {
             self.publish(p);
         }
     }
+
+    fn library_items(&self) -> Vec<library::LibraryItem> {
+        self.library
+            .iter()
+            .map(|e| library::LibraryItem {
+                id: e.id,
+                name: e.project.name.clone(),
+                track_count: e.project.tracks.len(),
+            })
+            .collect()
+    }
+
+    fn flush_open_project(&mut self) {
+        let Some(id) = self.open_project_id else {
+            return;
+        };
+        let live = (*self.current_project()).clone();
+        if let Some(entry) = self.library.iter_mut().find(|e| e.id == id) {
+            entry.project = live;
+        }
+    }
+
+    fn persist_now(&mut self, announce: bool) {
+        self.flush_open_project();
+        if let Some(id) = self.open_project_id {
+            if let Some(idx) = self.library.iter().position(|e| e.id == id) {
+                match persist::save_project(&self.persist_root, &mut self.library[idx]) {
+                    Ok(()) => {
+                        self.dirty = false;
+                        self.last_persist = Instant::now();
+                        if announce {
+                            self.status = "Сохранено".into();
+                        }
+                    }
+                    Err(e) => {
+                        self.status = format!("Не удалось сохранить: {e}");
+                        return;
+                    }
+                }
+            }
+        }
+        if let Err(e) = persist::save_index(&self.persist_root, self.next_project_id) {
+            self.status = format!("Не удалось сохранить список: {e}");
+        }
+    }
+
+    fn persist_if_due(&mut self) {
+        if self.screen != AppScreen::Studio || !self.dirty {
+            return;
+        }
+        if self.trim_drag.is_some() || self.clip_move_drag.is_some() || self.marker_drag.is_some()
+        {
+            return;
+        }
+        if self.last_persist.elapsed() < Duration::from_millis(2000) {
+            return;
+        }
+        self.persist_now(false);
+    }
+
+    fn persist_everything(&mut self) {
+        self.flush_open_project();
+        for i in 0..self.library.len() {
+            if let Err(e) = persist::save_project(&self.persist_root, &mut self.library[i]) {
+                eprintln!("save project {}: {e}", self.library[i].id);
+            }
+        }
+        if let Err(e) = persist::save_index(&self.persist_root, self.next_project_id) {
+            eprintln!("save library: {e}");
+        }
+        self.dirty = false;
+        self.last_persist = Instant::now();
+    }
+
+    fn reset_studio_view(&mut self) {
+        self.timeline_scroll_px = 0.0;
+        self.selected_clip_id = None;
+        self.trim_drag = None;
+        self.clip_move_drag = None;
+        self.clip_move_from_alt_duplicate = false;
+        self.clip_settle_anim = None;
+        self.follow_playhead_suspended = false;
+        self.selected_marker = None;
+        self.marker_drag = None;
+        self.selected_track = 0;
+        self.sampler_track = None;
+        self.status.clear();
+        self.request_seek(0.0);
+        self.playhead_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
+    }
+
+    fn go_home(&mut self) {
+        self.transport_stop();
+        self.close_sampler();
+        self.flush_open_project();
+        self.persist_now(false);
+        self.open_project_id = None;
+        self.screen = AppScreen::Library;
+    }
+
+    fn create_project(&mut self) {
+        self.flush_open_project();
+        let sr = self.current_project().device_sample_rate;
+        let mut project = Project::empty(sr);
+        let id = self.next_project_id;
+        self.next_project_id = self.next_project_id.saturating_add(1);
+        project.name = format!("Проект {id}");
+        self.library.push(DiskProject::new(id, project.clone()));
+        self.publish(project);
+        self.open_project_id = Some(id);
+        self.screen = AppScreen::Studio;
+        self.reset_studio_view();
+        self.dirty = true;
+        self.persist_now(false);
+    }
+
+    fn open_project(&mut self, id: u64) {
+        self.flush_open_project();
+        self.persist_now(false);
+        let Some(project) = self
+            .library
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.project.clone())
+        else {
+            return;
+        };
+        self.publish(project);
+        self.open_project_id = Some(id);
+        self.screen = AppScreen::Studio;
+        self.reset_studio_view();
+        self.dirty = false;
+    }
+
+    fn add_studio_track(&mut self) {
+        let mut p = (*self.current_project()).clone();
+        let i = project_actions::add_track(&mut p);
+        self.selected_track = i;
+        self.publish(p);
+        self.open_sampler(i);
+    }
+
+    fn open_sampler(&mut self, track_index: usize) {
+        let proj = self.current_project();
+        if track_index >= proj.tracks.len() {
+            return;
+        }
+        let n = proj
+            .clips
+            .iter()
+            .find(|c| c.track_index == track_index)
+            .map(|c| c.sample.data.len() as f32)
+            .unwrap_or(1.0);
+        drop(proj);
+        self.sampler_track = Some(track_index);
+        self.selected_track = track_index;
+        self.sampler_view_start = 0.0;
+        self.sampler_view_len = n.max(1.0);
+        let mut p = (*self.current_project()).clone();
+        p.sampler_preview.playing = false;
+        p.sampler_preview.track_index = track_index;
+        self.publish(p);
+        self.engine.reset_preview_secs();
+    }
+
+    fn close_sampler(&mut self) {
+        if self.sampler_track.is_none() {
+            return;
+        }
+        self.sampler_track = None;
+        let mut p = (*self.current_project()).clone();
+        p.sampler_preview.playing = false;
+        self.publish(p);
+        self.engine.reset_preview_secs();
+    }
+
+    fn sampler_toggle_preview(&mut self) {
+        let Some(track) = self.sampler_track else {
+            return;
+        };
+        let mut p = (*self.current_project()).clone();
+        if p.sampler_preview.playing {
+            p.sampler_preview.playing = false;
+        } else {
+            p.transport.is_playing = false;
+            p.sampler_preview.playing = true;
+            p.sampler_preview.generation = p.sampler_preview.generation.wrapping_add(1);
+            p.sampler_preview.track_index = track;
+            self.engine.reset_preview_secs();
+        }
+        self.publish(p);
+    }
+
+    fn sampler_nudge_pitch(&mut self, delta: i32) {
+        let Some(track) = self.sampler_track else {
+            return;
+        };
+        let mut p = (*self.current_project()).clone();
+        if let Some(t) = p.tracks.get_mut(track) {
+            t.pitch_semitones = (t.pitch_semitones + delta).clamp(-24, 24);
+        }
+        self.publish(p);
+    }
+
+    fn sampler_nudge_tempo(&mut self, delta: f32) {
+        let Some(track) = self.sampler_track else {
+            return;
+        };
+        let mut p = (*self.current_project()).clone();
+        if let Some(t) = p.tracks.get_mut(track) {
+            t.source_tempo_bpm = (t.source_tempo_bpm + delta).clamp(20.0, 400.0);
+            p.tempo_bpm = t.source_tempo_bpm;
+        }
+        self.publish(p);
+    }
+
+    fn apply_sampler_action(&mut self, action: sampler::SamplerAction) {
+        match action {
+            sampler::SamplerAction::Close => self.close_sampler(),
+            sampler::SamplerAction::TogglePreview => self.sampler_toggle_preview(),
+            sampler::SamplerAction::PitchDelta(d) => self.sampler_nudge_pitch(d),
+            sampler::SamplerAction::TempoDelta(d) => self.sampler_nudge_tempo(d),
+            sampler::SamplerAction::LoadFile => self.try_pick_and_load_audio(),
+        }
+    }
 }
 
 fn marker_slot_from_keys(i: &egui::InputState) -> Option<u8> {
@@ -484,122 +808,239 @@ fn marker_slot_from_keys(i: &egui::InputState) -> Option<u8> {
 
 impl eframe::App for TinySamplerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.startup_maximize_after > 0 {
+            self.startup_maximize_after -= 1;
+            if self.startup_maximize_after == 0 {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+            }
+            ctx.request_repaint();
+        }
         self.poll_audio_load(ctx);
         self.poll_dropped_files(ctx);
         if let Some(msg) = self.engine.recover_if_needed(&self.project_swap) {
             self.status = msg;
         }
         self.handle_global_shortcuts(ctx);
+        self.persist_if_due();
+        if ctx.input(|i| i.viewport().close_requested()) {
+            self.persist_everything();
+        }
 
-        let btn = theme::TRANSPORT_BTN_DIAMETER;
-        let btn_gap = theme::TRANSPORT_BTN_GAP;
+        match self.screen {
+            AppScreen::Library => {
+                let items = self.library_items();
+                let data_dir = self.persist_root.display().to_string();
+                if let Some(action) = library::show(ctx, &items, &data_dir, &self.status) {
+                    match action {
+                        library::LibraryAction::Create => self.create_project(),
+                        library::LibraryAction::Open(id) => self.open_project(id),
+                    }
+                }
+            }
+            AppScreen::Studio => self.show_studio(ctx),
+        }
 
-        egui::TopBottomPanel::top("tempo_bar")
-            .exact_height(theme::TEMPO_BAR_HEIGHT)
+        if self.sampler_track.is_some() {
+            self.show_sampler_modal(ctx);
+        }
+
+        ctx.request_repaint_after(std::time::Duration::from_millis(33));
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.persist_everything();
+    }
+}
+
+impl TinySamplerApp {
+    fn show_sampler_modal(&mut self, ctx: &egui::Context) {
+        let Some(track) = self.sampler_track else {
+            return;
+        };
+        let proj = self.current_project();
+        if track >= proj.tracks.len() {
+            drop(proj);
+            self.close_sampler();
+            return;
+        }
+        let track_name = proj.tracks[track].name.clone();
+        let pitch_semitones = proj.tracks[track].pitch_semitones;
+        let tempo_bpm = proj.tracks[track].source_tempo_bpm;
+        let speed = proj.tracks[track].playback_speed();
+        let preview_playing = proj.sampler_preview.playing;
+        let sample_rate = proj.device_sample_rate;
+        let sample_buf = proj.clips.iter().find(|c| c.track_index == track).map(|c| {
+            (Arc::clone(&c.sample.data), Arc::clone(&c.sample.peaks))
+        });
+        drop(proj);
+        let status = self.status.clone();
+        let sample = sample_buf
+            .as_ref()
+            .map(|(data, peaks)| (data.as_slice(), peaks.as_ref()));
+        let model = sampler::SamplerModel {
+            track_name: &track_name,
+            pitch_semitones,
+            tempo_bpm,
+            sample,
+            preview_playing,
+            preview_secs: self.engine.preview_secs(),
+            sample_rate,
+            speed,
+            status: &status,
+        };
+        let action = sampler::show(
+            ctx,
+            model,
+            &mut self.sampler_view_start,
+            &mut self.sampler_view_len,
+        );
+        if let Some(action) = action {
+            self.apply_sampler_action(action);
+        }
+    }
+
+    fn show_studio(&mut self, ctx: &egui::Context) {
+        let btn = theme::STUDIO_TRANSPORT_BTN;
+
+        egui::TopBottomPanel::top("studio_top")
+            .exact_height(theme::STUDIO_TOP_BAR_H)
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
-                    ui.add_space(10.0);
-                    ui.label(egui::RichText::new("Темп").weak());
-                    let mut bpm = self.current_project().tempo_bpm;
-                    let tempo_edit = ui.add(
-                        egui::DragValue::new(&mut bpm)
-                            .suffix(" BPM")
-                            .range(20.0..=400.0)
-                            .speed(0.25)
-                            .min_decimals(0)
-                            .max_decimals(1),
-                    );
-                    if tempo_edit.changed() {
-                        let mut p = (*self.current_project()).clone();
-                        p.tempo_bpm = bpm.clamp(20.0, 400.0);
-                        self.publish(p);
+                    ui.add_space(8.0);
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new("⌂ Домой").color(Color32::WHITE))
+                                .fill(theme::color_track_gutter_selected())
+                                .min_size(Vec2::new(88.0, 32.0)),
+                        )
+                        .clicked()
+                    {
+                        self.go_home();
                     }
                     ui.add_space(16.0);
-                    ui.label(egui::RichText::new("Линейка").weak());
-                    if ui
-                        .selectable_label(
-                            self.ruler_kind == timeline::RulerKind::Time,
-                            "Время",
-                        )
-                        .clicked()
-                    {
-                        self.ruler_kind = timeline::RulerKind::Time;
-                    }
-                    if ui
-                        .selectable_label(
-                            self.ruler_kind == timeline::RulerKind::Tempo,
-                            "Темп",
-                        )
-                        .clicked()
-                    {
-                        self.ruler_kind = timeline::RulerKind::Tempo;
-                    }
-                });
-            });
-
-        egui::TopBottomPanel::bottom("transport")
-            .exact_height(btn + theme::TRANSPORT_RESERVE_H)
-            .show(ctx, |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        let total_w = btn * 3.0 + btn_gap * 2.0;
-                        ui.add_space(((ui.available_width() - total_w) * 0.5).max(0.0));
-
+                    let playing = self.current_project().transport.is_playing;
+                    if playing {
                         if timeline::round_transport_btn(
                             ui,
-                            "+",
-                            "Load audio (Ctrl+O)",
-                            theme::color_transport_load(),
-                            btn,
-                        )
-                        .clicked()
-                        {
-                            self.try_pick_and_load_audio();
-                        }
-                        ui.add_space(btn_gap);
-                        let playing = self.current_project().transport.is_playing;
-                        if playing {
-                            if timeline::round_transport_btn(
-                                ui,
-                                "⏸",
-                                "Pause (Space)",
-                                theme::color_transport_pause(),
-                                btn,
-                            )
-                            .clicked()
-                            {
-                                self.transport_toggle_play_pause();
-                            }
-                        } else if timeline::round_transport_btn(
-                            ui,
-                            "▶",
-                            "Play (Space)",
-                            theme::color_transport_play(),
+                            "⏸",
+                            "Pause (Space)",
+                            theme::color_transport_pause(),
                             btn,
                         )
                         .clicked()
                         {
                             self.transport_toggle_play_pause();
                         }
-                        ui.add_space(btn_gap);
-                        if timeline::round_transport_btn(
-                            ui,
-                            "⏹",
-                            "Stop (Ctrl+Space)",
-                            theme::color_transport_stop(),
-                            btn,
+                    } else if timeline::round_transport_btn(
+                        ui,
+                        "▶",
+                        "Play (Space)",
+                        theme::color_transport_play(),
+                        btn,
+                    )
+                    .clicked()
+                    {
+                        self.transport_toggle_play_pause();
+                    }
+                    ui.add_space(8.0);
+                    if timeline::round_transport_btn(
+                        ui,
+                        "⏹",
+                        "Stop (Ctrl+Space)",
+                        theme::color_transport_stop(),
+                        btn,
+                    )
+                    .clicked()
+                    {
+                        self.transport_stop();
+                    }
+                    ui.add_space(16.0);
+                    let clock = timeline::format_clock(self.playhead_secs());
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(clock)
+                                .monospace()
+                                .size(20.0)
+                                .color(Color32::from_gray(230)),
                         )
-                        .clicked()
-                        {
-                            self.transport_stop();
+                        .selectable(false),
+                    );
+                    ui.add_space(16.0);
+                    let bpm = self.current_project().tempo_bpm;
+                    ui.label(
+                        egui::RichText::new(format!("{bpm:.0} BPM"))
+                            .weak()
+                            .size(14.0),
+                    );
+                    let name = self.current_project().name.clone();
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(12.0);
+                        if !self.status.is_empty() {
+                            ui.label(egui::RichText::new(&self.status).weak().size(12.0));
+                        }
+                        ui.label(egui::RichText::new(name).weak().size(14.0));
+                    });
+                });
+            });
+
+        if self.screen != AppScreen::Studio {
+            return;
+        }
+
+        egui::SidePanel::left("studio_tracks")
+            .exact_width(theme::STUDIO_SIDEBAR_W)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("Треки").strong().size(15.0));
+                ui.add_space(6.0);
+                let proj = self.current_project();
+                let names: Vec<String> = proj.tracks.iter().map(|t| t.name.clone()).collect();
+                let n = names.len();
+                drop(proj);
+                if n == 0 {
+                    ui.label(
+                        egui::RichText::new("Пока нет дорожек")
+                            .weak()
+                            .size(12.0),
+                    );
+                }
+                egui::ScrollArea::vertical()
+                    .max_height(ui.available_height() - 52.0)
+                    .show(ui, |ui| {
+                        for (i, name) in names.iter().enumerate() {
+                            let selected = self.selected_track == i;
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .selectable_label(selected, name)
+                                    .on_hover_text("Выбрать дорожку")
+                                    .clicked()
+                                {
+                                    self.selected_track = i;
+                                }
+                                if ui
+                                    .small_button("сэмпл")
+                                    .on_hover_text("Инструмент сэмплинга")
+                                    .clicked()
+                                {
+                                    self.open_sampler(i);
+                                }
+                            });
                         }
                     });
-                    if !self.status.is_empty() {
-                        ui.add_space(2.0);
-                        ui.label(egui::RichText::new(&self.status).weak().size(12.0));
-                    }
-                });
+                ui.add_space(8.0);
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new("+ Добавить трек").color(Color32::WHITE),
+                        )
+                        .fill(theme::color_transport_play())
+                        .min_size(Vec2::new(ui.available_width(), 32.0)),
+                    )
+                    .clicked()
+                {
+                    self.add_studio_track();
+                }
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -612,10 +1053,20 @@ impl eframe::App for TinySamplerApp {
 
             ui.vertical(|ui| {
                 let viewport_w = ui.available_width();
-                // Spare empty lane under the last clip so the next drop has a visible target.
-                let n_lanes = proj.track_count().saturating_add(1).max(2);
+                let n_lanes = proj.tracks.len();
+                if n_lanes == 0 {
+                    ui.add_space(48.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new("Добавьте трек слева, чтобы открыть инструмент сэмплинга")
+                                .weak()
+                                .size(15.0),
+                        );
+                    });
+                    return;
+                }
                 self.selected_track = self.selected_track.min(n_lanes.saturating_sub(1));
-                let gutter_w = theme::TRACK_GUTTER_WIDTH;
+                let gutter_w = 0.0_f32;
                 let avail_for_lanes = (ui.available_height() - theme::TIME_RULER_HEIGHT).max(80.0);
                 let block_h = (avail_for_lanes / n_lanes as f32).clamp(
                     theme::MARKER_LANE_HEIGHT + 72.0,
@@ -627,11 +1078,12 @@ impl eframe::App for TinySamplerApp {
                     .iter()
                     .map(|m| m.time_secs)
                     .fold(0.0f32, f32::max);
-                let end_secs = proj
-                    .clips
-                    .iter()
-                    .map(|c| c.start_time_secs + c.timeline_duration_secs(proj.device_sample_rate))
-                    .fold(4.0f32, f32::max)
+                let mut end_secs = 4.0f32;
+                for i in 0..proj.clips.len() {
+                    let t1 = proj.clips[i].start_time_secs + proj.clip_sounding_secs_at(i);
+                    end_secs = end_secs.max(t1);
+                }
+                let end_secs = end_secs
                     .max(self.playhead_secs() + 0.5)
                     .max(marker_end + 0.5);
 
@@ -641,7 +1093,7 @@ impl eframe::App for TinySamplerApp {
                     Vec2::new(viewport_w, theme::TIME_RULER_HEIGHT + timeline_height),
                 );
                 if let Some(hp) = ctx.pointer_hover_pos() {
-                    if combined_rect.contains(hp) {
+                    if self.sampler_track.is_none() && combined_rect.contains(hp) {
                         let (ctrl, alt, dy) = ctx.input(|i| {
                             (
                                 i.modifiers.ctrl,
@@ -691,14 +1143,7 @@ impl eframe::App for TinySamplerApp {
                     Vec2::new(viewport_w, theme::TIME_RULER_HEIGHT),
                     egui::Sense::hover(),
                 );
-                let ruler_gutter = Rect::from_min_size(
-                    ruler_row.min,
-                    Vec2::new(gutter_w, ruler_row.height()),
-                );
-                let ruler_rect = Rect::from_min_max(
-                    Pos2::new(ruler_row.left() + gutter_w, ruler_row.top()),
-                    ruler_row.max,
-                );
+                let ruler_rect = ruler_row;
                 let (tracks_rect, _) =
                     ui.allocate_exact_size(Vec2::new(viewport_w, timeline_height), egui::Sense::hover());
                 let layout = timeline::TrackLayout {
@@ -820,7 +1265,6 @@ impl eframe::App for TinySamplerApp {
                                     view_left,
                                     pps,
                                     self.timeline_scroll_px,
-                                    proj_now.device_sample_rate,
                                 ) {
                                     self.trim_drag = Some(d);
                                 }
@@ -833,7 +1277,6 @@ impl eframe::App for TinySamplerApp {
                                     view_left,
                                     pps,
                                     self.timeline_scroll_px,
-                                    proj_now.device_sample_rate,
                                 ) {
                                     self.selected_clip_id = Some(id);
                                     self.selected_marker = None;
@@ -917,7 +1360,6 @@ impl eframe::App for TinySamplerApp {
                         view_left,
                         pps,
                         self.timeline_scroll_px,
-                        proj.device_sample_rate,
                     ) {
                         ctx.set_cursor_icon(CursorIcon::ResizeHorizontal);
                     } else if timeline::pointer_on_selected_clip_move_body(
@@ -928,7 +1370,6 @@ impl eframe::App for TinySamplerApp {
                         view_left,
                         pps,
                         self.timeline_scroll_px,
-                        proj.device_sample_rate,
                     ) {
                         if ctx.input(|i| i.modifiers.alt) {
                             ctx.set_cursor_icon(CursorIcon::Alias);
@@ -952,7 +1393,6 @@ impl eframe::App for TinySamplerApp {
                             view_left,
                             pps,
                             sc,
-                            proj.device_sample_rate,
                         ) {
                             self.selected_clip_id = Some(id);
                             self.selected_marker = None;
@@ -1012,8 +1452,6 @@ impl eframe::App for TinySamplerApp {
                 let scroll = self.timeline_scroll_px;
                 let to_screen = |t: f32| -> f32 { view_left + t * pps - scroll };
 
-                let ruler_row_painter = ui.painter_at(ruler_row);
-                ruler_row_painter.rect_filled(ruler_gutter, 0.0, theme::color_track_gutter());
                 let ruler_painter = ui.painter_at(ruler_rect);
                 timeline::paint_ruler(
                     &ruler_painter,
@@ -1021,7 +1459,7 @@ impl eframe::App for TinySamplerApp {
                     pps,
                     scroll,
                     ctx,
-                    self.ruler_kind,
+                    timeline::RulerKind::Tempo,
                     self.current_project().tempo_bpm,
                 );
                 let play_x_head = to_screen(self.playhead_secs());
@@ -1051,12 +1489,6 @@ impl eframe::App for TinySamplerApp {
                             Stroke::new(1.5_f32, theme::color_track_gutter_selected()),
                         );
                     }
-                    timeline::paint_track_gutter(
-                        &painter,
-                        layout.gutter_rect(lane),
-                        lane,
-                        lane == self.selected_track,
-                    );
                     timeline::paint_marker_lane(
                         &painter,
                         &proj.markers,
@@ -1081,13 +1513,14 @@ impl eframe::App for TinySamplerApp {
                 for &i in &clip_draw_order {
                     let clip = &proj.clips[i];
                     let ghost = clip.placement_preview;
+                    let dur = proj.clip_sounding_secs_at(i);
                     let clip_rect = timeline::clip_rect_on_timeline(
                         clip,
                         &layout,
                         view_left,
                         pps,
                         scroll,
-                        proj.device_sample_rate,
+                        dur,
                     );
 
                     let fill = if ghost {
@@ -1097,7 +1530,7 @@ impl eframe::App for TinySamplerApp {
                     };
                     painter.rect_filled(clip_rect, 3.0, fill);
 
-                    paint_waveform_overlay(
+                    paint_clip_waveform(
                         &painter,
                         clip_rect,
                         layout.clips_rect(clip.track_index),
@@ -1223,85 +1656,34 @@ impl eframe::App for TinySamplerApp {
                 }
             });
         });
-
-        ctx.request_repaint_after(std::time::Duration::from_millis(33));
     }
 }
 
-/// Audacity-style filled min/max envelope (mono). Only paints columns inside `view_rect`.
-fn paint_waveform_overlay(
+fn paint_clip_waveform(
     painter: &egui::Painter,
     clip_rect: Rect,
     view_rect: Rect,
     data: &[f32],
-    peaks: &PeakPyramid,
+    peaks: &waveform::PeakPyramid,
     trim_start: usize,
     trim_end: usize,
     ghost: bool,
 ) {
-    let vis = trim_end.saturating_sub(trim_start);
-    if vis == 0 {
-        return;
-    }
-    let vis_rect = clip_rect.intersect(view_rect);
-    if vis_rect.width() < 0.5 || vis_rect.height() < 0.5 {
-        return;
-    }
-
-    let pixel_w = clip_rect.width().max(1.0);
-    let vis_f = vis as f32;
-    let center_y = clip_rect.center().y;
-    let half_h = ((clip_rect.height() - 4.0).max(4.0)) * 0.5;
-    let y_of = |s: f32| center_y - s.clamp(-1.0, 1.0) * half_h;
-
     let mut wave_col = theme::color_clip_waveform();
     let mut zero_col = theme::color_clip_zero_line();
     if ghost {
         wave_col = Color32::from_rgba_unmultiplied(wave_col.r(), wave_col.g(), wave_col.b(), 140);
         zero_col = Color32::from_rgba_unmultiplied(zero_col.r(), zero_col.g(), zero_col.b(), 90);
     }
-
-    let clip_painter = painter.with_clip_rect(vis_rect);
-    clip_painter.line_segment(
-        [
-            Pos2::new(vis_rect.left(), center_y),
-            Pos2::new(vis_rect.right(), center_y),
-        ],
-        Stroke::new(1.0_f32, zero_col),
+    waveform::paint_waveform_overlay(
+        painter,
+        clip_rect,
+        view_rect,
+        data,
+        peaks,
+        trim_start,
+        trim_end,
+        wave_col,
+        zero_col,
     );
-
-    let x0 = vis_rect.left().floor() as i32;
-    let x1 = vis_rect.right().ceil() as i32;
-    for x in x0..x1 {
-        let xf = x as f32;
-        let u0 = ((xf - clip_rect.left()) / pixel_w).clamp(0.0, 1.0);
-        let u1 = ((xf + 1.0 - clip_rect.left()) / pixel_w).clamp(0.0, 1.0);
-        if u1 <= u0 {
-            continue;
-        }
-        let s0 = trim_start as f32 + u0 * vis_f;
-        let s1 = trim_start as f32 + u1 * vis_f;
-        let (mn, mx) = if (s1 - s0) <= 1.0 {
-            let a = crate::waveform::sample_at(data, s0);
-            let b = crate::waveform::sample_at(data, s1.max(s0 + 1e-4));
-            (a.min(b), a.max(b))
-        } else {
-            crate::waveform::min_max_range(data, peaks, s0.floor() as usize, s1.ceil() as usize)
-        };
-        let mut yt = y_of(mx);
-        let mut yb = y_of(mn);
-        if yb < yt {
-            std::mem::swap(&mut yt, &mut yb);
-        }
-        if yb - yt < 1.0 {
-            let mid = (yt + yb) * 0.5;
-            yt = mid - 0.5;
-            yb = mid + 0.5;
-        }
-        clip_painter.rect_filled(
-            Rect::from_min_max(Pos2::new(xf, yt), Pos2::new(xf + 1.0, yb)),
-            0.0,
-            wave_col,
-        );
-    }
 }

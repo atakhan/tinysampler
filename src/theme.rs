@@ -36,6 +36,12 @@ pub const TRANSPORT_RESERVE_H: f32 = 40.0;
 
 pub const TIMELINE_TRACK_HEIGHT: f32 = 160.0;
 
+pub const STUDIO_TOP_BAR_H: f32 = 52.0;
+pub const STUDIO_SIDEBAR_W: f32 = 200.0;
+pub const STUDIO_TRANSPORT_BTN: f32 = 36.0;
+pub const SAMPLER_MAP_H: f32 = 60.0;
+pub const SAMPLER_WAVE_H: f32 = 320.0;
+
 pub fn color_transport_load() -> Color32 {
     Color32::from_rgb(64, 108, 168)
 }
@@ -122,4 +128,12 @@ pub fn color_track_gutter() -> Color32 {
 
 pub fn color_track_gutter_selected() -> Color32 {
     Color32::from_rgb(48, 70, 118)
+}
+
+pub fn color_sampler_viewport() -> Color32 {
+    Color32::from_rgba_unmultiplied(220, 230, 255, 55)
+}
+
+pub fn color_sampler_viewport_stroke() -> Color32 {
+    Color32::from_rgba_unmultiplied(230, 240, 255, 180)
 }

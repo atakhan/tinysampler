@@ -2,15 +2,37 @@
 
 use std::path::Path;
 
-use crate::model::{Clip, ClipId, CueMarker, Project, Sample};
+use crate::model::{Clip, ClipId, CueMarker, Project, Sample, Track};
 use crate::theme::MIN_TRIM_DURATION_SECS;
 use crate::timeline::{TrimDrag, TrimSide};
 use crate::wav_loader;
 
-pub fn append_audio_clip(project: &mut Project, sample: Sample, label: String) -> usize {
-    let id = project.alloc_clip_id();
+pub fn add_track(project: &mut Project) -> usize {
+    let i = project.tracks.len();
+    project.tracks.push(Track {
+        name: format!("Трек {}", i + 1),
+        pitch_semitones: 0,
+        source_tempo_bpm: project.tempo_bpm.clamp(20.0, 400.0),
+    });
+    i
+}
+
+pub fn set_track_sample(project: &mut Project, track_index: usize, sample: Sample, label: String) {
     let n = sample.data.len();
-    let track_index = project.next_track_index();
+    if let Some(clip) = project
+        .clips
+        .iter_mut()
+        .find(|c| c.track_index == track_index)
+    {
+        clip.sample = sample;
+        clip.label = label;
+        clip.trim_start = 0;
+        clip.trim_end = n;
+        clip.start_time_secs = 0.0;
+        clip.placement_preview = false;
+        return;
+    }
+    let id = project.alloc_clip_id();
     project.clips.push(Clip {
         id,
         start_time_secs: 0.0,
@@ -21,6 +43,11 @@ pub fn append_audio_clip(project: &mut Project, sample: Sample, label: String) -
         track_index,
         placement_preview: false,
     });
+}
+
+pub fn append_audio_clip(project: &mut Project, sample: Sample, label: String) -> usize {
+    let track_index = add_track(project);
+    set_track_sample(project, track_index, sample, label);
     track_index
 }
 
@@ -44,23 +71,30 @@ pub fn split_clip_at_playhead(
     let sr_f = sr as f32;
     let min_samples = ((MIN_TRIM_DURATION_SECS * sr_f).ceil() as usize).max(1);
 
-    let in_clip = |clip: &Clip| {
-        let t0 = clip.start_time_secs;
-        let t1 = t0 + clip.timeline_duration_secs(sr);
+    let in_clip_at = |project: &Project, i: usize| {
+        let speed = project.track_speed(project.clips[i].track_index).max(0.05);
+        let t0 = project.clips[i].start_time_secs;
+        let t1 = t0 + project.clips[i].timeline_duration_secs(sr) / speed;
         playhead_secs > t0 && playhead_secs < t1
     };
     let idx = preferred
         .and_then(|id| project.clip_index(id))
-        .filter(|&i| in_clip(&project.clips[i]))
-        .or_else(|| project.clips.iter().position(in_clip));
+        .filter(|&i| in_clip_at(project, i))
+        .or_else(|| (0..project.clips.len()).find(|&i| in_clip_at(project, i)));
     let Some(i) = idx else {
         return Err("Разрез: поставьте плейхед внутри клипа.".into());
     };
 
     let clip = project.clips.remove(i);
     let kept_left_id = clip.id;
-    let mut split_at =
-        clip.trim_start + ((playhead_secs - clip.start_time_secs) * sr_f).round() as usize;
+    let speed = project
+        .tracks
+        .get(clip.track_index)
+        .map(Track::playback_speed)
+        .unwrap_or(1.0)
+        .max(0.05);
+    let mut split_at = clip.trim_start
+        + ((playhead_secs - clip.start_time_secs) * sr_f * speed).round() as usize;
     split_at = split_at
         .max(clip.trim_start + min_samples)
         .min(clip.trim_end.saturating_sub(min_samples));
@@ -69,7 +103,7 @@ pub fn split_clip_at_playhead(
         return Err("Нельзя разрезать: слишком короткий фрагмент.".into());
     }
 
-    let split_time = clip.start_time_secs + (split_at - clip.trim_start) as f32 / sr_f;
+    let split_time = clip.start_time_secs + (split_at - clip.trim_start) as f32 / (sr_f * speed);
     let right_id = project.alloc_clip_id();
 
     let left = Clip {
@@ -111,13 +145,14 @@ pub fn delete_clip(project: &mut Project, id: ClipId) -> bool {
 pub fn apply_trim_delta(project: &mut Project, drag: TrimDrag, dx_px: f32, pps: f32) -> bool {
     let sr = project.device_sample_rate as f32;
     let min_samples = ((MIN_TRIM_DURATION_SECS * sr).ceil() as usize).max(1);
-    let ds_samples = ((dx_px / pps) * sr).round() as i64;
-    if ds_samples == 0 {
-        return false;
-    }
     let Some(idx) = project.clip_index(drag.clip_id) else {
         return false;
     };
+    let speed = project.track_speed(project.clips[idx].track_index).max(0.05);
+    let ds_samples = ((dx_px / pps) * sr * speed).round() as i64;
+    if ds_samples == 0 {
+        return false;
+    }
     let clip = match project.clips.get_mut(idx) {
         Some(c) => c,
         None => return false,
@@ -133,7 +168,7 @@ pub fn apply_trim_delta(project: &mut Project, drag: TrimDrag, dx_px: f32, pps: 
                 return false;
             }
             clip.trim_start = ts_new as usize;
-            clip.start_time_secs += actual as f32 / sr;
+            clip.start_time_secs += actual as f32 / (sr * speed);
             true
         }
         TrimSide::Right => {
@@ -149,18 +184,16 @@ pub fn apply_trim_delta(project: &mut Project, drag: TrimDrag, dx_px: f32, pps: 
 }
 
 fn merge_other_clip_intervals(project: &Project, exclude_idx: usize) -> Vec<(f32, f32)> {
-    let sr = project.device_sample_rate;
     let track = project.clips[exclude_idx].track_index;
-    let mut v: Vec<(f32, f32)> = project
-        .clips
-        .iter()
-        .enumerate()
-        .filter(|&(i, c)| i != exclude_idx && c.track_index == track)
-        .map(|(_, c)| {
-            let d = c.timeline_duration_secs(sr);
-            (c.start_time_secs, c.start_time_secs + d)
-        })
-        .collect();
+    let mut v: Vec<(f32, f32)> = Vec::new();
+    for i in 0..project.clips.len() {
+        if i == exclude_idx || project.clips[i].track_index != track {
+            continue;
+        }
+        let t0 = project.clips[i].start_time_secs;
+        let d = project.clip_sounding_secs_at(i);
+        v.push((t0, t0 + d));
+    }
     v.sort_by(|a, b| a.0.total_cmp(&b.0));
     let mut out: Vec<(f32, f32)> = Vec::new();
     for (s, e) in v {
@@ -223,24 +256,22 @@ pub fn clip_start_respecting_no_overlap(
     proposed_start: f32,
     hint_old: f32,
 ) -> f32 {
-    let sr = project.device_sample_rate;
-    let d = project.clips[idx].timeline_duration_secs(sr);
+    let d = project.clip_sounding_secs_at(idx);
     let ranges = feasible_start_ranges(project, idx, d);
     clamp_start_to_feasible_ranges(proposed_start, &ranges, hint_old)
 }
 
 /// True if clip `idx` overlaps any other clip on the timeline (positive-length intersection).
 pub fn clip_overlaps_others(project: &Project, idx: usize) -> bool {
-    let sr = project.device_sample_rate;
-    let c = &project.clips[idx];
-    let t0 = c.start_time_secs;
-    let t1 = t0 + c.timeline_duration_secs(sr);
-    for (j, o) in project.clips.iter().enumerate() {
-        if j == idx || o.track_index != c.track_index {
+    let track = project.clips[idx].track_index;
+    let t0 = project.clips[idx].start_time_secs;
+    let t1 = t0 + project.clip_sounding_secs_at(idx);
+    for j in 0..project.clips.len() {
+        if j == idx || project.clips[j].track_index != track {
             continue;
         }
-        let o0 = o.start_time_secs;
-        let o1 = o0 + o.timeline_duration_secs(sr);
+        let o0 = project.clips[j].start_time_secs;
+        let o1 = o0 + project.clip_sounding_secs_at(j);
         if t0 < o1 && o0 < t1 {
             return true;
         }
@@ -404,7 +435,20 @@ mod tests {
         assert_eq!(p.clips[0].track_index, 0);
         assert_eq!(p.clips[1].track_index, 1);
         assert_eq!(p.clips[2].track_index, 2);
+        assert_eq!(p.tracks.len(), 3);
         assert_eq!(p.track_count(), 3);
+    }
+
+    #[test]
+    fn set_track_sample_replaces_existing_clip() {
+        let mut p = Project::empty(48_000);
+        let i = add_track(&mut p);
+        set_track_sample(&mut p, i, dummy_sample(), "a".into());
+        set_track_sample(&mut p, i, dummy_sample(), "b".into());
+        assert_eq!(p.tracks.len(), 1);
+        assert_eq!(p.clips.len(), 1);
+        assert_eq!(p.clips[0].label, "b");
+        assert_eq!(p.clips[0].track_index, 0);
     }
 
     #[test]

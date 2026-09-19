@@ -108,11 +108,10 @@ pub fn clip_rect_on_timeline(
     view_left: f32,
     pps: f32,
     scroll: f32,
-    sample_rate: u32,
+    duration_secs: f32,
 ) -> Rect {
-    let dur = clip.timeline_duration_secs(sample_rate);
     let x0 = view_left + clip.start_time_secs * pps - scroll;
-    let w = dur * pps;
+    let w = duration_secs * pps;
     let pad = 8.0_f32;
     let clips = layout.clips_rect(clip.track_index);
     Rect::from_min_size(
@@ -133,10 +132,11 @@ pub fn trim_hit_test(
     view_left: f32,
     pps: f32,
     scroll: f32,
-    sample_rate: u32,
 ) -> Option<TrimDrag> {
-    let clip = proj.clips.iter().find(|c| c.id == selected_id)?;
-    let cr = clip_rect_on_timeline(clip, layout, view_left, pps, scroll, sample_rate);
+    let i = proj.clip_index(selected_id)?;
+    let dur = proj.clip_sounding_secs_at(i);
+    let clip = &proj.clips[i];
+    let cr = clip_rect_on_timeline(clip, layout, view_left, pps, scroll, dur);
     let hw = TRIM_HANDLE_WIDTH_PX.min(cr.width() * 0.5);
     let left_h = Rect::from_min_size(cr.min, Vec2::new(hw, cr.height()));
     let right_h = Rect::from_min_max(Pos2::new(cr.right() - hw, cr.top()), cr.max);
@@ -163,12 +163,11 @@ pub fn pointer_near_trim_handle(
     view_left: f32,
     pps: f32,
     scroll: f32,
-    sample_rate: u32,
 ) -> bool {
     let Some(sid) = selected else {
         return false;
     };
-    trim_hit_test(proj, sid, pos, layout, view_left, pps, scroll, sample_rate).is_some()
+    trim_hit_test(proj, sid, pos, layout, view_left, pps, scroll).is_some()
 }
 
 /// Selected clip body (full rect minus trim handles) — for move hover / drag start.
@@ -180,18 +179,19 @@ pub fn pointer_on_selected_clip_move_body(
     view_left: f32,
     pps: f32,
     scroll: f32,
-    sample_rate: u32,
 ) -> bool {
     let Some(sid) = selected else {
         return false;
     };
-    if trim_hit_test(proj, sid, pos, layout, view_left, pps, scroll, sample_rate).is_some() {
+    if trim_hit_test(proj, sid, pos, layout, view_left, pps, scroll).is_some() {
         return false;
     }
-    let Some(clip) = proj.clips.iter().find(|c| c.id == sid) else {
+    let Some(i) = proj.clip_index(sid) else {
         return false;
     };
-    let cr = clip_rect_on_timeline(clip, layout, view_left, pps, scroll, sample_rate);
+    let dur = proj.clip_sounding_secs_at(i);
+    let clip = &proj.clips[i];
+    let cr = clip_rect_on_timeline(clip, layout, view_left, pps, scroll, dur);
     cr.contains(pos)
 }
 
@@ -202,13 +202,13 @@ pub fn clip_index_at_pointer(
     view_left: f32,
     pps: f32,
     scroll: f32,
-    sample_rate: u32,
 ) -> Option<usize> {
     let mut order: Vec<usize> = (0..proj.clips.len()).collect();
     order.sort_by_key(|&i| !proj.clips[i].placement_preview);
     order.into_iter().find_map(|i| {
+        let dur = proj.clip_sounding_secs_at(i);
         let clip = &proj.clips[i];
-        let r = clip_rect_on_timeline(clip, layout, view_left, pps, scroll, sample_rate);
+        let r = clip_rect_on_timeline(clip, layout, view_left, pps, scroll, dur);
         r.contains(p).then_some(i)
     })
 }
@@ -220,9 +220,8 @@ pub fn clip_id_at_pointer(
     view_left: f32,
     pps: f32,
     scroll: f32,
-    sample_rate: u32,
 ) -> Option<ClipId> {
-    let i = clip_index_at_pointer(proj, p, layout, view_left, pps, scroll, sample_rate)?;
+    let i = clip_index_at_pointer(proj, p, layout, view_left, pps, scroll)?;
     Some(proj.clips[i].id)
 }
 
@@ -726,4 +725,11 @@ pub fn playhead_in_viewport(rect: Rect, playhead_secs: f32, pps: f32, scroll: f3
     let m = playhead_follow_margin(rect);
     let play_x = rect.left() + playhead_secs * pps - scroll;
     play_x >= rect.left() + m && play_x <= rect.right() - m
+}
+
+pub fn format_clock(secs: f32) -> String {
+    let s = secs.max(0.0);
+    let m = (s / 60.0).floor() as u32;
+    let rem = s - m as f32 * 60.0;
+    format!("{m:02}:{rem:06.3}")
 }

@@ -79,6 +79,35 @@ fn load_mp3_mono_f32(path: &Path, target_rate: u32) -> Result<Sample, String> {
     finalize_mono_sample(mono, sample_rate, target_rate, "MP3")
 }
 
+/// Write mono f32 PCM as a 32-bit float WAV (UI / persist thread only).
+pub fn write_wav_f32_mono(path: &Path, data: &[f32], sample_rate: u32) -> Result<(), String> {
+    if sample_rate == 0 {
+        return Err("sample rate is 0".into());
+    }
+    let spec = WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 32,
+        sample_format: SampleFormat::Float,
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let tmp = path.with_extension("wav.tmp");
+    {
+        let mut writer = hound::WavWriter::create(&tmp, spec).map_err(|e| e.to_string())?;
+        for &s in data {
+            writer.write_sample(s).map_err(|e| e.to_string())?;
+        }
+        writer.finalize().map_err(|e| e.to_string())?;
+    }
+    if path.exists() {
+        std::fs::remove_file(path).map_err(|e| e.to_string())?;
+    }
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 fn finalize_mono_sample(
     mono: Vec<f32>,
     src_rate: u32,

@@ -18,6 +18,7 @@ pub struct AudioEngine {
     seek_pending: Arc<AtomicBool>,
     seek_target_secs_bits: Arc<AtomicU32>,
     last_rebuild_attempt: Option<Instant>,
+    preview_secs_bits: Arc<AtomicU32>,
 }
 
 /// Runs a short 440 Hz sine on the default output to validate the pipeline (step 0).
@@ -70,6 +71,7 @@ fn start_stream(
     playhead_secs_bits: Arc<AtomicU32>,
     seek_pending: Arc<AtomicBool>,
     seek_target_secs_bits: Arc<AtomicU32>,
+    preview_secs_bits: Arc<AtomicU32>,
     stream_failed: Arc<AtomicBool>,
 ) -> Result<(cpal::Stream, u32, String), String> {
     let host = cpal::default_host();
@@ -86,6 +88,8 @@ fn start_stream(
         playhead_secs = 0.0;
     }
     let mut last_stop_generation = project.load().transport.stop_generation;
+    let mut preview_secs = 0.0f32;
+    let mut last_preview_generation = project.load().sampler_preview.generation;
 
     let err_flag = Arc::clone(&stream_failed);
     let stream = device
@@ -98,6 +102,10 @@ fn start_stream(
                     playhead_secs = 0.0;
                     last_stop_generation = proj.transport.stop_generation;
                 }
+                if proj.sampler_preview.generation != last_preview_generation {
+                    preview_secs = 0.0;
+                    last_preview_generation = proj.sampler_preview.generation;
+                }
 
                 if seek_pending.swap(false, Ordering::AcqRel) {
                     playhead_secs = f32::from_bits(seek_target_secs_bits.load(Ordering::Relaxed));
@@ -109,12 +117,30 @@ fn start_stream(
 
                 let rate = sample_rate as f32;
                 let n = data.len() / channels;
+                let previewing = proj.sampler_preview.playing;
+
+                if previewing {
+                    let base = preview_secs;
+                    for i in 0..n {
+                        let t = base + i as f32 / rate;
+                        let v = mix::mix_sampler_preview_at(proj, t);
+                        let frame = i * channels;
+                        for c in 0..channels {
+                            data[frame + c] = v;
+                        }
+                    }
+                    preview_secs += n as f32 / rate;
+                    preview_secs_bits.store(preview_secs.to_bits(), Ordering::Relaxed);
+                    playhead_secs_bits.store(playhead_secs.to_bits(), Ordering::Relaxed);
+                    return;
+                }
 
                 if !proj.transport.is_playing {
                     for o in data.iter_mut() {
                         *o = 0.0;
                     }
                     playhead_secs_bits.store(playhead_secs.to_bits(), Ordering::Relaxed);
+                    preview_secs_bits.store(preview_secs.to_bits(), Ordering::Relaxed);
                     return;
                 }
 
@@ -162,11 +188,13 @@ where
 
     let project = Arc::new(ArcSwap::from_pointee(make_project(sample_rate)));
     let stream_failed = Arc::new(AtomicBool::new(false));
+    let preview_secs_bits = Arc::new(AtomicU32::new(0.0f32.to_bits()));
     let (stream, out_rate, device_name) = start_stream(
         Arc::clone(&project),
         Arc::clone(&playhead_secs_bits),
         Arc::clone(&seek_pending),
         Arc::clone(&seek_target_secs_bits),
+        Arc::clone(&preview_secs_bits),
         Arc::clone(&stream_failed),
     )?;
 
@@ -179,11 +207,21 @@ where
         seek_pending,
         seek_target_secs_bits,
         last_rebuild_attempt: None,
+        preview_secs_bits,
     };
     Ok((engine, project))
 }
 
 impl AudioEngine {
+    pub fn preview_secs(&self) -> f32 {
+        f32::from_bits(self.preview_secs_bits.load(Ordering::Relaxed))
+    }
+
+    pub fn reset_preview_secs(&self) {
+        self.preview_secs_bits
+            .store(0.0f32.to_bits(), Ordering::Relaxed);
+    }
+
     /// Recreate the cpal stream when the default device changes or the old stream dies
     /// (Bluetooth unplug, speakers selected, etc.).
     pub fn recover_if_needed(&mut self, project: &Arc<ArcSwap<Project>>) -> Option<String> {
@@ -215,6 +253,7 @@ impl AudioEngine {
             Arc::clone(&self.playhead_secs_bits),
             Arc::clone(&self.seek_pending),
             Arc::clone(&self.seek_target_secs_bits),
+            Arc::clone(&self.preview_secs_bits),
             Arc::clone(&self.stream_failed),
         ) {
             Ok((stream, sample_rate, device_name)) => {

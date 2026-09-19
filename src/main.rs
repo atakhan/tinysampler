@@ -2,9 +2,12 @@
 
 mod app;
 mod audio;
+mod library;
 mod mix;
 mod model;
+mod persist;
 mod project_actions;
+mod sampler;
 mod theme;
 mod timeline;
 mod waveform;
@@ -21,9 +24,16 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    // Do not call `with_maximized(true)` here. On Windows eframe always applies
+    // `inner_size` *after* window creation (`apply_viewport_builder_to_window`).
+    // That `SetWindowPos` shrinks the HWND while leaving WS_MAXIMIZE / winit's
+    // MAXIMIZED flag set, so the caption button shows "restore" but the window
+    // stays at 960×640. Later `Maximized(true)` is a no-op because the flag is
+    // already true. Maximize is requested from the first UI frames instead.
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([960.0, 640.0])
+            .with_inner_size([1280.0, 800.0])
+            .with_maximized(false)
             .with_title("tinysampler")
             .with_drag_and_drop(true),
         ..Default::default()

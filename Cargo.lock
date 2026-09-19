@@ -3502,6 +3502,8 @@ dependencies = [
  "egui",
  "hound",
  "rfd",
+ "serde",
+ "serde_json",
  "symphonia",
 ]
 
