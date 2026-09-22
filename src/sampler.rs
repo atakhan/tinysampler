@@ -4,7 +4,7 @@ use egui::{
     Align2, Color32, CursorIcon, Event, FontId, Key, PointerButton, Pos2, Rect, Sense, Shape, Stroke, Vec2,
 };
 
-use crate::model::{PadEdge, PadMarker};
+use crate::model::{PadEdge, PadMarker, SampleSlice};
 use crate::theme;
 use crate::waveform::{self, PeakPyramid};
 
@@ -43,6 +43,7 @@ pub struct SamplerModel<'a> {
     pub speed: f32,
     pub status: &'a str,
     pub pad_markers: &'a [PadMarker],
+    pub slices: &'a [SampleSlice],
     pub selected_pad: Option<u8>,
     pub active_pad: Option<u8>,
 }
@@ -53,6 +54,7 @@ pub enum SamplerAction {
     PitchDelta(i32),
     TempoDelta(f32),
     LoadFile,
+    AddSounds,
     SeekCursor { sample_index: usize },
     MovePad {
         slot: u8,
@@ -62,6 +64,9 @@ pub enum SamplerAction {
     DeletePad { slot: u8 },
     SelectPad { slot: Option<u8> },
     TriggerPad { slot: u8 },
+    /// Move file `from` so it occupies slot `to`. Files stay contiguous.
+    ReorderSlice { from: usize, to: usize },
+    DeleteSlice { index: usize },
 }
 
 pub fn pad_slot_from_keys(i: &egui::InputState) -> Option<u8> {
@@ -187,7 +192,19 @@ pub fn show(
                     action = Some(SamplerAction::TempoDelta(1.0));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Загрузить WAV / MP3").clicked() {
+                    if ui
+                        .button("Добавить звуки")
+                        .on_hover_text("WAV или MP3 встанут в конец текущего сэмпла. Можно выбрать несколько.")
+                        .clicked()
+                    {
+                        action = Some(SamplerAction::AddSounds);
+                    }
+                    if model.sample.is_some()
+                        && ui
+                            .button("Заменить")
+                            .on_hover_text("Заменить весь сэмпл одним файлом")
+                            .clicked()
+                    {
                         action = Some(SamplerAction::LoadFile);
                     }
                 });
@@ -205,6 +222,12 @@ pub fn show(
                 handle_map_nav(ctx, &map_resp, map_rect, view_start, view_len, sample_n);
             }
 
+            if !model.slices.is_empty() {
+                ui.add_space(6.0);
+                if let Some(slice_action) = show_slice_badges(ui, ctx, model.slices) {
+                    action = Some(slice_action);
+                }
+            }
             ui.add_space(8.0);
             let pad_block_h = theme::SAMPLER_PAD_H * theme::SAMPLER_PAD_ROWS as f32
                 + theme::SAMPLER_PAD_GAP
@@ -241,14 +264,14 @@ pub fn show(
             ui.add_space(6.0);
             if model.sample.is_none() {
                 ui.label(
-                    egui::RichText::new("Перетащите WAV или MP3 сюда — или нажмите «Загрузить».")
+                    egui::RichText::new("Перетащите WAV или MP3 сюда — или нажмите «Добавить звуки». Можно несколько файлов: каждый встанет после предыдущего.")
                         .weak()
                         .italics(),
                 );
             } else {
                 ui.label(
                     egui::RichText::new(
-                        "Клик по waveform — базовая позиция. Стоп возвращает курсор к ней. Alt+скролл — горизонтально. Полоски — начало и конец сэмпла, тяни чтобы изменить длину. Свободный пэд (Q–I / A–K) — сэмпл от курсора.",
+                        "Клик по waveform — базовая позиция. Стоп возвращает курсор к ней. «Добавить звуки» ставит файлы друг за другом и вешает каждый на свободный пэд. Бейджи между картой и дорожкой двигают файлы встык, × удаляет файл. Alt+скролл — горизонтально. Полоски — начало и конец сэмпла, тяни чтобы изменить длину.",
                     )
                     .weak()
                     .size(12.0),
@@ -259,10 +282,170 @@ pub fn show(
             }
         });
 
-    if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+    if !open {
         action = Some(SamplerAction::Close);
     }
     action
+}
+
+const SLICE_BADGE_H: f32 = 28.0;
+const SLICE_BADGE_MIN_W: f32 = 108.0;
+
+fn slice_drag_id() -> egui::Id {
+    egui::Id::new("sampler_slice_drag")
+}
+
+fn slice_hover_id() -> egui::Id {
+    egui::Id::new("sampler_slice_hover")
+}
+
+fn show_slice_badges(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    slices: &[SampleSlice],
+) -> Option<SamplerAction> {
+    let n = slices.len();
+    if n == 0 {
+        return None;
+    }
+    let mut action = None;
+    let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), SLICE_BADGE_H), Sense::hover());
+    let rects = badge_rects(row, slices);
+    let pointer = ctx.input(|i| i.pointer.interact_pos());
+    let dragging: Option<usize> = ctx.data(|d| d.get_temp(slice_drag_id()));
+    let released = ctx.input(|i| i.pointer.any_released());
+    let sticky: Option<usize> = ctx.data(|d| d.get_temp(slice_hover_id()));
+    let hover = if let Some(from) = dragging.filter(|_| !released) {
+        Some(from)
+    } else {
+        badge_under_pointer(&rects, pointer, sticky)
+    };
+    if let Some(index) = hover {
+        ctx.data_mut(|d| d.insert_temp(slice_hover_id(), index));
+    }
+    let to = pointer
+        .map(|pos| slice_index_at_x(slices, row, pos.x))
+        .unwrap_or(0);
+    let mut order: Vec<usize> = (0..n).filter(|&i| hover != Some(i)).collect();
+    if let Some(index) = hover {
+        order.push(index);
+    }
+    let mut deleted = false;
+    for slice_i in order {
+        let Some(slice) = slices.get(slice_i) else {
+            continue;
+        };
+        let Some(badge) = rects.get(slice_i).copied() else {
+            continue;
+        };
+        let on_top = hover == Some(slice_i);
+        let dragging_this = dragging == Some(slice_i) && !released;
+        let close_rect = Rect::from_min_size(
+            Pos2::new(badge.right() - 22.0, badge.top()),
+            Vec2::new(22.0, badge.height()),
+        );
+        let drag_rect = Rect::from_min_max(badge.min, Pos2::new(close_rect.left(), badge.bottom()));
+        let drag_resp = ui.interact(drag_rect, egui::Id::new(("slice_drag", slice_i)), Sense::drag());
+        let fill = if dragging_this || on_top {
+            Color32::from_rgb(70, 110, 86)
+        } else {
+            Color32::from_rgb(48, 52, 64)
+        };
+        let stroke = if dragging_this || on_top {
+            Stroke::new(1.5_f32, Color32::from_rgb(130, 220, 160))
+        } else {
+            Stroke::new(1.0_f32, Color32::from_gray(80))
+        };
+        ui.painter().rect(badge, 6.0, fill, stroke);
+        ui.painter().text(
+            Pos2::new(drag_rect.left() + 8.0, drag_rect.center().y),
+            Align2::LEFT_CENTER,
+            badge_label(&slice.label),
+            FontId::proportional(12.0),
+            Color32::from_gray(230),
+        );
+        if drag_resp.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::Grab);
+        }
+        if drag_resp.drag_started() && !released {
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(slice_drag_id(), slice_i));
+        }
+        let close = ui
+            .new_child(egui::UiBuilder::new().max_rect(close_rect))
+            .small_button("×")
+            .on_hover_text("Удалить этот файл");
+        if close.clicked() {
+            action = Some(SamplerAction::DeleteSlice { index: slice_i });
+            deleted = true;
+            ui.ctx().data_mut(|d| d.remove_temp::<usize>(slice_drag_id()));
+        }
+    }
+    if released && !deleted {
+        if let Some(from) = dragging {
+            ctx.data_mut(|d| d.remove_temp::<usize>(slice_drag_id()));
+            if to != from && from < n {
+                action = Some(SamplerAction::ReorderSlice { from, to });
+            }
+        }
+    }
+    action
+}
+
+fn badge_rects(row: Rect, slices: &[SampleSlice]) -> Vec<Rect> {
+    let total = slices
+        .last()
+        .map(|s| s.end_index.max(1))
+        .unwrap_or(1) as f32;
+    let width = row.width().max(1.0);
+    slices
+        .iter()
+        .map(|slice| {
+            let x0 = row.left() + slice.start_index as f32 / total * width;
+            let x1 = row.left() + slice.end_index as f32 / total * width;
+            let w = (x1 - x0).max(SLICE_BADGE_MIN_W).min(width);
+            let left = x0.min(row.right() - w).max(row.left());
+            Rect::from_min_size(Pos2::new(left, row.top()), Vec2::new(w, row.height()))
+        })
+        .collect()
+}
+
+fn badge_under_pointer(rects: &[Rect], pointer: Option<Pos2>, sticky: Option<usize>) -> Option<usize> {
+    let pos = pointer?;
+    if let Some(index) = sticky {
+        if rects.get(index).is_some_and(|rect| rect.contains(pos)) {
+            return Some(index);
+        }
+    }
+    rects
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, rect)| rect.contains(pos))
+        .map(|(index, _)| index)
+}
+
+fn slice_index_at_x(slices: &[SampleSlice], row: Rect, x: f32) -> usize {
+    let total = slices
+        .last()
+        .map(|s| s.end_index.max(1))
+        .unwrap_or(1) as f32;
+    let idx = ((x - row.left()) / row.width().max(1.0) * total).floor();
+    let idx = idx.clamp(0.0, total - 1.0) as usize;
+    slices
+        .iter()
+        .position(|slice| idx < slice.end_index)
+        .unwrap_or(slices.len().saturating_sub(1))
+}
+
+fn badge_label(label: &str) -> String {
+    let mut chars = label.chars();
+    let short: String = chars.by_ref().take(16).collect();
+    if chars.next().is_some() {
+        format!("{short}…")
+    } else {
+        short
+    }
 }
 
 fn format_pitch(semitones: i32) -> String {
@@ -612,7 +795,8 @@ fn paint_map(
                 );
             }
         }
-        paint_cursors(&painter, rect, 0.0, n, model);
+            paint_cursors(&painter, rect, 0.0, n, model);
+            paint_slice_boundaries(&painter, rect, model.slices, 0.0, n, false);
     } else {
         painter.text(
             rect.center(),
@@ -649,6 +833,7 @@ fn paint_main_wave(
             theme::color_clip_waveform(),
             theme::color_clip_zero_line(),
         );
+        paint_slice_boundaries(&painter, rect, model.slices, view_start, view_len, true);
         paint_pad_markers(&painter, rect, model, view_start, view_len);
         paint_cursors(&painter, rect, view_start, view_len.max(1.0), model);
         let _ = n;
@@ -660,6 +845,42 @@ fn paint_main_wave(
             FontId::proportional(16.0),
             Color32::from_gray(120),
         );
+    }
+}
+
+fn paint_slice_boundaries(
+    painter: &egui::Painter,
+    rect: Rect,
+    slices: &[SampleSlice],
+    view_start: f32,
+    view_len: f32,
+    labels: bool,
+) {
+    if slices.len() < 2 || view_len <= 0.0 {
+        return;
+    }
+    let col = Color32::from_gray(170);
+    let font = FontId::proportional(11.0);
+    let span_end = view_start + view_len;
+    for slice in slices {
+        let start_f = slice.start_index as f32;
+        if start_f <= view_start || start_f > span_end {
+            continue;
+        }
+        let x = rect.left() + (start_f - view_start) / view_len * rect.width();
+        painter.line_segment(
+            [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+            Stroke::new(1.0_f32, col),
+        );
+        if labels {
+            painter.text(
+                Pos2::new(x + 4.0, rect.top() + 4.0),
+                Align2::LEFT_TOP,
+                &slice.label,
+                font.clone(),
+                col,
+            );
+        }
     }
 }
 

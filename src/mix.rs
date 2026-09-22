@@ -36,7 +36,15 @@ pub fn mix_mono_sample_at(project: &Project, t: f32) -> f32 {
     acc.clamp(-1.0, 1.0)
 }
 
-/// Preview of the sampling instrument at local time (seconds of wall clock).
+/// Preview of a file from the load window. Playback speed is 1 (not the track pitch).
+pub fn mix_file_audition_at(sample: &crate::model::Sample, t_local: f32, end_secs: f32) -> f32 {
+    if !t_local.is_finite() || t_local < 0.0 || (end_secs.is_finite() && t_local >= end_secs) {
+        return 0.0;
+    }
+    let idx = (t_local * sample.rate() as f32) as usize;
+    sample.data.get(idx).copied().unwrap_or(0.0)
+}
+
 pub fn mix_sampler_preview_at(project: &Project, t_local: f32) -> f32 {
     mix_track_preview_at(project, project.sampler_preview.track_id, t_local)
 }

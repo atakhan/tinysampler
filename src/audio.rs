@@ -93,6 +93,7 @@ fn start_stream(
         preview_secs = 0.0;
     }
     let mut last_preview_generation = project.load().sampler_preview.generation;
+    let mut last_audition_generation = project.load().audition.generation;
 
     let err_flag = Arc::clone(&stream_failed);
     let stream = device
@@ -102,8 +103,16 @@ fn start_stream(
                 let proj = project.load();
                 let proj = &*proj;
                 if proj.transport.stop_generation != last_stop_generation {
-                    playhead_secs = 0.0;
+                    playhead_secs = proj.transport.stop_return_secs;
+                    if !playhead_secs.is_finite() {
+                        playhead_secs = 0.0;
+                    }
+                    playhead_secs = playhead_secs.max(0.0);
                     last_stop_generation = proj.transport.stop_generation;
+                }
+                if proj.audition.generation != last_audition_generation {
+                    preview_secs = 0.0;
+                    last_audition_generation = proj.audition.generation;
                 }
                 if proj.sampler_preview.generation != last_preview_generation {
                     preview_secs = proj.sampler_preview.start_secs.max(0.0);
@@ -123,10 +132,11 @@ fn start_stream(
 
                 let rate = sample_rate as f32;
                 let n = data.len() / channels;
-                let mix_preview = proj.sampler_preview.playing;
-                let mix_song = proj.transport.is_playing;
+                let mix_audition = proj.audition.playing && proj.audition.sample.is_some();
+                let mix_preview = proj.sampler_preview.playing && !mix_audition;
+                let mix_song = proj.transport.is_playing && !mix_audition;
 
-                if !mix_preview && !mix_song {
+                if !mix_preview && !mix_song && !mix_audition {
                     for o in data.iter_mut() {
                         *o = 0.0;
                     }
@@ -143,6 +153,15 @@ fn start_stream(
                 let song_base = playhead_secs;
                 for i in 0..n {
                     let mut v = 0.0f32;
+                    if mix_audition {
+                        if let Some(sample) = proj.audition.sample.as_ref() {
+                            v += mix::mix_file_audition_at(
+                                sample,
+                                preview_base + i as f32 / rate,
+                                proj.audition.end_secs,
+                            );
+                        }
+                    }
                     if mix_preview {
                         v += mix::mix_sampler_preview_at(proj, preview_base + i as f32 / rate);
                     }
@@ -156,7 +175,7 @@ fn start_stream(
                     }
                 }
 
-                if mix_preview {
+                if mix_preview || mix_audition {
                     preview_secs += n as f32 / rate;
                     preview_secs_bits.store(preview_secs.to_bits(), Ordering::Relaxed);
                 } else {

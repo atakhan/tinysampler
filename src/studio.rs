@@ -19,8 +19,8 @@ impl TinySamplerApp {
         egui::TopBottomPanel::top("studio_top")
             .exact_height(theme::STUDIO_TOP_BAR_H)
             .show(ctx, |ui| {
-                ui.add_enabled_ui(!studio_locked, |ui| {
-                    ui.horizontal_centered(|ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.add_enabled_ui(!studio_locked, |ui| {
                         ui.add_space(8.0);
                         if ui
                             .add(
@@ -40,7 +40,7 @@ impl TinySamplerApp {
                             if timeline::round_transport_btn(
                                 ui,
                                 "⏸",
-                                "Pause (Space)",
+                                "Pause (Ctrl+Space)",
                                 theme::color_transport_pause(),
                                 btn,
                             )
@@ -63,7 +63,7 @@ impl TinySamplerApp {
                         if timeline::round_transport_btn(
                             ui,
                             "⏹",
-                            "Stop (Ctrl+Space)",
+                            "Stop (Space)",
                             theme::color_transport_stop(),
                             btn,
                         )
@@ -89,11 +89,26 @@ impl TinySamplerApp {
                                 .weak()
                                 .size(14.0),
                         );
-                        let name = self.current_project().name.clone();
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.add_space(12.0);
-                            if !self.status.is_empty() {
-                                ui.label(egui::RichText::new(&self.status).weak().size(12.0));
+                    });
+                    let name = self.current_project().name.clone();
+                    let status = self.status.clone();
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(12.0);
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("Настройки").color(Color32::WHITE),
+                                )
+                                .fill(theme::color_track_gutter_selected())
+                                .min_size(Vec2::new(108.0, 32.0)),
+                            )
+                            .clicked()
+                        {
+                            self.open_settings();
+                        }
+                        ui.add_enabled_ui(!studio_locked, |ui| {
+                            if !status.is_empty() {
+                                ui.label(egui::RichText::new(&status).weak().size(12.0));
                             }
                             ui.label(egui::RichText::new(name).weak().size(14.0));
                         });
@@ -105,60 +120,65 @@ impl TinySamplerApp {
             return;
         }
 
+        let panel_fill = ctx.style().visuals.panel_fill;
+        // Same top/bottom inset as the timeline panel so each sidebar row
+        // starts on the same Y as its lane.
+        let sidebar_frame = egui::Frame::none().inner_margin(egui::Margin::symmetric(0.0, 8.0)).fill(panel_fill);
         egui::SidePanel::left("studio_tracks")
             .exact_width(theme::STUDIO_SIDEBAR_W)
             .resizable(false)
+            .frame(sidebar_frame)
             .show(ctx, |ui| {
                 ui.add_enabled_ui(!studio_locked, |ui| {
-                    ui.add_space(8.0);
-                    ui.label(egui::RichText::new("Треки").strong().size(15.0));
-                    ui.add_space(6.0);
                     let proj = self.current_project();
                     let names: Vec<(TrackId, String)> =
                         proj.tracks.iter().map(|t| (t.id, t.name.clone())).collect();
                     drop(proj);
                     if names.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new("Треки").strong().size(15.0));
+                        ui.add_space(6.0);
                         ui.label(
                             egui::RichText::new("Пока нет дорожек")
                                 .weak()
                                 .size(12.0),
                         );
-                    }
-                    egui::ScrollArea::vertical()
-                        .max_height(ui.available_height() - 52.0)
-                        .show(ui, |ui| {
-                            for (id, name) in &names {
-                                let selected = self.selected_track == Some(*id);
-                                ui.horizontal(|ui| {
-                                    if ui
-                                        .selectable_label(selected, name)
-                                        .on_hover_text("Выбрать дорожку")
-                                        .clicked()
-                                    {
-                                        self.selected_track = Some(*id);
-                                    }
-                                    if ui
-                                        .small_button("сэмпл")
-                                        .on_hover_text("Инструмент сэмплинга")
-                                        .clicked()
-                                    {
-                                        self.open_sampler(*id);
-                                    }
-                                });
-                            }
-                        });
-                    ui.add_space(8.0);
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new("+ Добавить трек").color(Color32::WHITE),
+                        ui.add_space(8.0);
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("+ Добавить трек").color(Color32::WHITE),
+                                )
+                                .fill(theme::color_transport_play())
+                                .min_size(Vec2::new(ui.available_width(), 32.0)),
                             )
-                            .fill(theme::color_transport_play())
-                            .min_size(Vec2::new(ui.available_width(), 32.0)),
-                        )
-                        .clicked()
-                    {
+                            .clicked()
+                        {
+                            self.add_studio_track();
+                        }
+                        return;
+                    }
+
+                    // Flush with the ruler: default item spacing would open a gap
+                    // the lanes do not have.
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    let block_h = studio_lane_block_height(ui.available_height(), names.len());
+                    if show_track_sidebar_header(ui) {
                         self.add_studio_track();
+                    }
+                    for (lane, (id, name)) in names.iter().enumerate() {
+                        match show_track_sidebar_row(
+                            ui,
+                            block_h,
+                            lane,
+                            *id,
+                            name,
+                            self.selected_track == Some(*id),
+                        ) {
+                            TrackSidebarAction::Select(id) => self.selected_track = Some(id),
+                            TrackSidebarAction::Sampler(id) => self.open_sampler(id),
+                            TrackSidebarAction::None => {}
+                        }
                     }
                 });
             });
@@ -185,12 +205,9 @@ impl TinySamplerApp {
                     self.selected_track = proj.tracks.first().map(|t| t.id);
                 }
                 let gutter_w = 0.0_f32;
-                let avail_for_lanes = (ui.available_height() - theme::TIME_RULER_HEIGHT).max(80.0);
-                let min_h = theme::MARKER_LANE_HEIGHT + 72.0;
-                let block_h = (avail_for_lanes / n_lanes as f32).clamp(
-                    min_h,
-                    theme::TIMELINE_TRACK_HEIGHT + theme::MARKER_LANE_HEIGHT,
-                );
+                // Match the sidebar: no gap between the ruler and the first lane.
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let block_h = studio_lane_block_height(ui.available_height(), n_lanes);
                 let timeline_height = block_h * n_lanes as f32;
                 let marker_end = proj
                     .markers
@@ -259,6 +276,9 @@ impl TinySamplerApp {
                 let timeline_w = (viewport_w - gutter_w).max(1.0);
                 let content_w = (end_secs * pps).max(timeline_w);
                 let max_scroll = (content_w - timeline_w).max(0.0);
+                if self.timeline_scroll_px > max_scroll {
+                    self.timeline_scroll_px = max_scroll;
+                }
 
                 let (ruler_row, _) = ui.allocate_exact_size(
                     Vec2::new(viewport_w, theme::TIME_RULER_HEIGHT),
@@ -503,7 +523,7 @@ impl TinySamplerApp {
                                     && p.x >= view_left
                                 {
                                     let t = time_at(p.x);
-                                    self.request_seek(t);
+                                    self.seek_studio(t);
                                     self.timeline_scroll_px =
                                         (view_left + t * pps - p.x).clamp(0.0, max_scroll);
                                     self.follow_playhead_suspended = false;
@@ -556,6 +576,11 @@ impl TinySamplerApp {
                     timeline::RulerKind::Tempo,
                     self.current_project().tempo_bpm,
                 );
+                let show_base = (proj.transport.is_playing || self.studio_transport_paused)
+                    && (self.studio_base_secs - self.playhead_secs()).abs() > 0.001;
+                if show_base {
+                    paint_studio_base_cursor(&ruler_painter, ruler_rect, to_screen(self.studio_base_secs), true);
+                }
                 let play_x_head = to_screen(self.playhead_secs());
                 if play_x_head >= ruler_rect.left() && play_x_head <= ruler_rect.right() {
                     ruler_painter.line_segment(
@@ -663,6 +688,14 @@ impl TinySamplerApp {
                     }
                 }
 
+                if show_base {
+                    paint_studio_base_cursor(
+                        &painter,
+                        tracks_rect,
+                        to_screen(self.studio_base_secs),
+                        false,
+                    );
+                }
                 let play_x = to_screen(self.playhead_secs());
                 if play_x >= view_left && play_x <= tracks_rect.right() {
                     painter.line_segment(
@@ -684,5 +717,300 @@ impl TinySamplerApp {
                 }
             });
         });
+    }
+
+    pub(crate) fn open_settings(&mut self) {
+        self.settings_browse = self
+            .sound_library_dir
+            .clone()
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(crate::browser::default_audio_dir);
+        self.settings_open = true;
+    }
+
+    pub(crate) fn show_settings_window(&mut self, ctx: &egui::Context) {
+        let mut open = true;
+        let saved = self.sound_library_dir.clone();
+        let browse = self.settings_browse.clone();
+        let mut enter = None;
+        let mut go_up = false;
+        let mut choose = false;
+        egui::Window::new("Настройки")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(480.0)
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 56.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new("Папка библиотеки").strong());
+                ui.label(
+                    egui::RichText::new(
+                        "Инструмент сэмплинга открывает загрузку звуков в этой папке.",
+                    )
+                    .weak()
+                    .size(12.0),
+                );
+                ui.add_space(4.0);
+                let saved_text = match &saved {
+                    Some(path) if path.is_dir() => path.display().to_string(),
+                    Some(path) => format!("{} · папка недоступна", path.display()),
+                    None => "Не выбрана — откроется папка «Музыка»".into(),
+                };
+                ui.label(egui::RichText::new(saved_text).monospace().size(12.0));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Вверх").clicked() {
+                        go_up = true;
+                    }
+                    if ui.button("Использовать эту папку").clicked() {
+                        choose = true;
+                    }
+                });
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(browse.display().to_string())
+                        .monospace()
+                        .size(12.0),
+                );
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("settings_library_dirs")
+                    .max_height(280.0)
+                    .show(ui, |ui| {
+                        let dirs = list_child_dirs(&browse);
+                        if dirs.is_empty() {
+                            ui.label(egui::RichText::new("Нет вложенных папок").weak());
+                        }
+                        for (name, path) in dirs {
+                            if ui.selectable_label(false, format!("📁 {name}")).clicked() {
+                                enter = Some(path);
+                            }
+                        }
+                    });
+            });
+        if go_up {
+            if let Some(parent) = self.settings_browse.parent() {
+                if parent != self.settings_browse {
+                    self.settings_browse = parent.to_path_buf();
+                }
+            }
+        }
+        if let Some(path) = enter {
+            if path.is_dir() {
+                self.settings_browse = path;
+            }
+        }
+        if choose {
+            self.choose_sound_library();
+        }
+        let escape_closes = self.load_browser.is_none()
+            && self.sampler_track.is_none()
+            && self.seq_editor.is_none()
+            && ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        if !open || escape_closes {
+            self.settings_open = false;
+        }
+    }
+
+    fn choose_sound_library(&mut self) {
+        if !self.settings_browse.is_dir() {
+            self.status = "Эта папка недоступна".into();
+            return;
+        }
+        self.sound_library_dir = Some(self.settings_browse.clone());
+        let settings = crate::persist::AppSettings {
+            sound_library_dir: self.sound_library_dir.clone(),
+        };
+        match crate::persist::save_settings(&self.persist.root, &settings) {
+            Ok(()) => self.status = format!("Библиотека: {}", self.settings_browse.display()),
+            Err(e) => self.status = format!("Не удалось сохранить настройки: {e}"),
+        }
+    }
+}
+
+fn list_child_dirs(dir: &std::path::Path) -> Vec<(String, std::path::PathBuf)> {
+    let mut dirs = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return dirs;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        dirs.push((name, path));
+    }
+    dirs.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    dirs
+}
+
+/// Lane height shared by the timeline and the track sidebar.
+/// `available_height` is the panel's inner height, including the ruler row.
+fn studio_lane_block_height(available_height: f32, n_lanes: usize) -> f32 {
+    let avail_for_lanes = (available_height - theme::TIME_RULER_HEIGHT).max(80.0);
+    let min_h = theme::MARKER_LANE_HEIGHT + 72.0;
+    let max_h = theme::TIMELINE_TRACK_HEIGHT + theme::MARKER_LANE_HEIGHT;
+    (avail_for_lanes / n_lanes.max(1) as f32).clamp(min_h, max_h)
+}
+
+enum TrackSidebarAction {
+    None,
+    Select(TrackId),
+    Sampler(TrackId),
+}
+
+/// Header strip the same height as the time ruler. Returns true when "+" was clicked.
+fn show_track_sidebar_header(ui: &mut egui::Ui) -> bool {
+    let width = ui.available_width();
+    let h = theme::TIME_RULER_HEIGHT;
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, h), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 0.0, theme::color_ruler_bg());
+    ui.painter().line_segment(
+        [
+            Pos2::new(rect.left(), rect.bottom()),
+            Pos2::new(rect.right(), rect.bottom()),
+        ],
+        Stroke::new(1.0_f32, theme::color_ruler_bottom_line()),
+    );
+
+    let mut add_clicked = false;
+    let mut header = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    header.add_space(8.0);
+    header.label(
+        egui::RichText::new("Треки")
+            .strong()
+            .size(14.0)
+            .color(theme::color_ruler_text()),
+    );
+    header.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.add_space(6.0);
+        add_clicked = ui
+            .add(
+                egui::Button::new(
+                    egui::RichText::new("+")
+                        .color(Color32::WHITE)
+                        .size(16.0),
+                )
+                .fill(theme::color_transport_play())
+                .min_size(Vec2::new(28.0, 22.0)),
+            )
+            .on_hover_text("Добавить трек")
+            .clicked();
+    });
+    add_clicked
+}
+
+/// One sidebar row, exactly `block_h` tall, with the same marker strip as the lane.
+fn show_track_sidebar_row(
+    ui: &mut egui::Ui,
+    block_h: f32,
+    lane: usize,
+    id: TrackId,
+    name: &str,
+    selected: bool,
+) -> TrackSidebarAction {
+    let width = ui.available_width();
+    let (row, _) = ui.allocate_exact_size(Vec2::new(width, block_h), egui::Sense::hover());
+    let marker_h = theme::MARKER_LANE_HEIGHT.min(row.height());
+    let marker = Rect::from_min_size(row.min, Vec2::new(row.width(), marker_h));
+    let clips = Rect::from_min_max(Pos2::new(row.left(), marker.bottom()), row.max);
+    let bg = if lane % 2 == 0 {
+        theme::color_timeline_bg()
+    } else {
+        theme::color_timeline_bg_alt()
+    };
+    ui.painter().rect_filled(clips, 0.0, bg);
+    ui.painter()
+        .rect_filled(marker, 0.0, theme::color_marker_lane_bg());
+    ui.painter().line_segment(
+        [
+            Pos2::new(marker.left(), marker.bottom()),
+            Pos2::new(marker.right(), marker.bottom()),
+        ],
+        Stroke::new(1.0_f32, theme::color_ruler_bottom_line()),
+    );
+    if selected {
+        ui.painter().rect_stroke(
+            row,
+            0.0,
+            Stroke::new(1.5_f32, theme::color_track_gutter_selected()),
+        );
+    }
+
+    let click = ui.interact(
+        row,
+        ui.id().with(("studio_track_row", id)),
+        egui::Sense::click(),
+    );
+    if click.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    let mut action = if click.clicked() {
+        TrackSidebarAction::Select(id)
+    } else {
+        TrackSidebarAction::None
+    };
+
+    let controls = Rect::from_min_size(
+        Pos2::new(row.left() + 8.0, marker.bottom() + 6.0),
+        Vec2::new((row.width() - 16.0).max(0.0), 24.0),
+    );
+    let mut controls_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(controls)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    let button_w = 72.0;
+    let name_w = (controls_ui.available_width() - button_w).max(16.0);
+    let name_color = if selected {
+        Color32::WHITE
+    } else {
+        Color32::from_gray(220)
+    };
+    controls_ui.add_sized(
+        Vec2::new(name_w, 22.0),
+        egui::Label::new(egui::RichText::new(name).size(14.0).color(name_color))
+            .selectable(false)
+            .truncate(),
+    );
+    if controls_ui
+        .small_button("сэмпл")
+        .on_hover_text("Инструмент сэмплинга")
+        .clicked()
+    {
+        action = TrackSidebarAction::Sampler(id);
+    }
+    action
+}
+
+fn paint_studio_base_cursor(painter: &egui::Painter, rect: Rect, x: f32, ruler: bool) {
+    if x < rect.left() || x > rect.right() {
+        return;
+    }
+    let col = theme::color_sampler_base();
+    painter.line_segment(
+        [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+        Stroke::new(1.5_f32, col),
+    );
+    if ruler {
+        let top = rect.top();
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                Pos2::new(x - 5.0, top),
+                Pos2::new(x + 5.0, top),
+                Pos2::new(x, top + 8.0),
+            ],
+            col,
+            Stroke::NONE,
+        ));
     }
 }

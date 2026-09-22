@@ -16,6 +16,7 @@ mod time;
 mod timeline;
 mod waveform;
 mod wav_loader;
+mod browser;
 
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();

@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    CueMarker, NoteId, PadMarker, PadNote, Project, Sample, SeqClip, SeqId, Track, TrackId,
+    CueMarker, NoteId, PadMarker, PadNote, Project, Sample, SampleSlice, SeqClip, SeqId, Track,
+    TrackId,
 };
 use crate::project_actions::{pad_default_len, pad_range_from_start};
 use crate::wav_loader;
@@ -76,6 +77,18 @@ struct TrackFile {
     sample: Option<String>,
     #[serde(default)]
     sample_label: String,
+    #[serde(default)]
+    sample_slices: Vec<SampleSliceFile>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SampleSliceFile {
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    start_index: usize,
+    #[serde(default)]
+    end_index: usize,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -137,6 +150,28 @@ struct SeqClipFile {
     track_index: Option<usize>,
     start_time_secs: f32,
     duration_secs: f32,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AppSettings {
+    #[serde(default)]
+    pub sound_library_dir: Option<PathBuf>,
+}
+
+fn settings_path(root: &Path) -> PathBuf {
+    root.join("settings.json")
+}
+
+pub fn load_settings(root: &Path) -> AppSettings {
+    let Ok(text) = fs::read_to_string(settings_path(root)) else {
+        return AppSettings::default();
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+pub fn save_settings(root: &Path, settings: &AppSettings) -> Result<(), String> {
+    let body = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?;
+    write_bytes_replace(&settings_path(root), &body)
 }
 
 pub fn default_root() -> PathBuf {
@@ -335,6 +370,15 @@ pub fn save_project(
                     .collect(),
                 sample,
                 sample_label: t.sample_label.clone(),
+                sample_slices: t
+                    .sample_slices
+                    .iter()
+                    .map(|s| SampleSliceFile {
+                        label: s.label.clone(),
+                        start_index: s.start_index,
+                        end_index: s.end_index,
+                    })
+                    .collect(),
             })
             .collect(),
         clips: Vec::new(),
@@ -537,12 +581,40 @@ pub fn load_project(root: &Path, id: u64) -> Result<LoadedProject, String> {
                 })
                 .collect()
         };
+        let sample_slices = {
+            let scaled: Vec<SampleSlice> = t
+                .sample_slices
+                .into_iter()
+                .filter_map(|s| {
+                    if n == 0 || s.end_index <= s.start_index {
+                        return None;
+                    }
+                    let start = scale_index(s.start_index, src_rate, dst_rate, max_i);
+                    let end = scale_index(s.end_index, src_rate, dst_rate, n).max(start + 1);
+                    Some(SampleSlice {
+                        label: s.label,
+                        start_index: start,
+                        end_index: end.min(n),
+                    })
+                })
+                .collect();
+            if scaled.is_empty() && n > 0 {
+                vec![SampleSlice {
+                    label: sample_label.clone(),
+                    start_index: 0,
+                    end_index: n,
+                }]
+            } else {
+                scaled
+            }
+        };
         tracks.push(Track {
             id: TrackId(id_raw),
             name: t.name,
             pitch_semitones: t.pitch_semitones.clamp(-24, 24),
             sample,
             sample_label,
+            sample_slices,
             pad_markers,
         });
     }
@@ -705,6 +777,7 @@ pub fn load_project(root: &Path, id: u64) -> Result<LoadedProject, String> {
         next_track_id,
         tempo_bpm: file.tempo_bpm.clamp(20.0, 400.0),
         sampler_preview: crate::model::SamplerPreview::default(),
+        audition: crate::model::FileAudition::default(),
     };
 
     Ok(LoadedProject {

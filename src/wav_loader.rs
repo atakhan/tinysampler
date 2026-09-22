@@ -12,7 +12,7 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
 /// PCM frames (~1 hour at 48 kHz). Also stops a stuck MP3 demuxer from growing forever.
-const MAX_MONO_SAMPLES: usize = 48_000 * 60 * 60;
+pub const MAX_MONO_SAMPLES: usize = 48_000 * 60 * 60;
 
 struct InMemoryMedia {
     inner: Cursor<Vec<u8>>,
@@ -117,6 +117,38 @@ fn finalize_mono_sample(mono: Vec<f32>, src_rate: u32, kind: &str) -> Result<Sam
 
     let peaks = waveform::PeakPyramid::build(&mono);
     Ok(Sample::new_mono(Arc::new(mono), Arc::new(peaks), src_rate))
+}
+
+/// Linear resample of mono PCM onto `dst_rate`. Same rate returns a copy.
+pub fn resample_mono(data: &[f32], src_rate: u32, dst_rate: u32) -> Result<Vec<f32>, String> {
+    if data.is_empty() {
+        return Err("пустой сэмпл".into());
+    }
+    if src_rate == 0 || dst_rate == 0 {
+        return Err("неизвестная частота сэмпла".into());
+    }
+    if src_rate == dst_rate {
+        return Ok(data.to_vec());
+    }
+    let dst_len = ((data.len() as f64) * f64::from(dst_rate) / f64::from(src_rate))
+        .round()
+        .max(1.0) as usize;
+    if dst_len > MAX_MONO_SAMPLES {
+        return Err("сэмпл слишком длинный".into());
+    }
+    let last = data.len() - 1;
+    let step = f64::from(src_rate) / f64::from(dst_rate);
+    let mut out = Vec::with_capacity(dst_len);
+    for i in 0..dst_len {
+        let pos = i as f64 * step;
+        let i0 = (pos.floor() as usize).min(last);
+        let i1 = (i0 + 1).min(last);
+        let frac = (pos - i0 as f64) as f32;
+        let a = data[i0];
+        let b = data[i1];
+        out.push(a + (b - a) * frac);
+    }
+    Ok(out)
 }
 
 fn decode_mp3_mono_f32(path: &Path) -> Result<(Vec<f32>, u32), String> {

@@ -8,6 +8,7 @@ use arc_swap::ArcSwap;
 use egui::Key;
 
 use crate::audio;
+use crate::browser::{self, BrowserAction, LoadBrowser};
 use crate::library;
 use crate::model::{NoteId, PadEdge, Project, SeqId, TrackId};
 use crate::persist;
@@ -20,6 +21,19 @@ use crate::session::PersistSession;
 pub(crate) enum AppScreen {
     Library,
     Studio,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AudioLoadKind {
+    Append,
+    Replace,
+    Audition,
+}
+
+pub(crate) struct PendingAudio {
+    path: PathBuf,
+    kind: AudioLoadKind,
+    audition_ticket: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -47,13 +61,20 @@ pub struct TinySamplerApp {
     pub(crate) seq_note_drag: Option<pianoroll::NoteDrag>,
     pub(crate) seq_drag: Option<SeqDrag>,
     pub(crate) load_rx: Option<Receiver<Result<(crate::model::Sample, String), String>>>,
+    pub(crate) load_kind: AudioLoadKind,
+    pub(crate) load_ticket: u64,
+    pub(crate) audition_ticket: u64,
+    pub(crate) load_browser: Option<LoadBrowser>,
     pub(crate) follow_playhead_suspended: bool,
-    pub(crate) pending_loads: VecDeque<PathBuf>,
+    pub(crate) pending_loads: VecDeque<PendingAudio>,
     pub(crate) selected_marker: Option<(u8, TrackId)>,
     pub(crate) marker_drag: Option<(u8, TrackId)>,
     pub(crate) selected_track: Option<TrackId>,
     pub(crate) screen: AppScreen,
     pub(crate) persist: PersistSession,
+    pub(crate) sound_library_dir: Option<PathBuf>,
+    pub(crate) settings_open: bool,
+    pub(crate) settings_browse: PathBuf,
     pub(crate) sampler_track: Option<TrackId>,
     pub(crate) sampler_view_start: f32,
     pub(crate) sampler_view_len: f32,
@@ -62,6 +83,11 @@ pub struct TinySamplerApp {
     pub(crate) sampler_active_pad: Option<u8>,
     pub(crate) piano_pad_held: Option<u8>,
     pub(crate) sampler_base_secs: f32,
+    /// Studio cursor at the moment Play was pressed. Stop returns here.
+    pub(crate) studio_base_secs: f32,
+    pub(crate) studio_base_scroll_px: f32,
+    /// Pause froze the playhead away from [`Self::studio_base_secs`].
+    pub(crate) studio_transport_paused: bool,
     pub(crate) startup_maximize_after: u8,
 }
 
@@ -82,6 +108,7 @@ impl TinySamplerApp {
             eprintln!("persist dir: {e}");
         }
         let (persist, load_err) = PersistSession::load(persist_root);
+        let settings = persist::load_settings(&persist.root);
         let mut status = String::new();
         if let Some(e) = load_err {
             status = format!("Загрузка проектов: {e}");
@@ -108,6 +135,10 @@ impl TinySamplerApp {
             seq_note_drag: None,
             seq_drag: None,
             load_rx: None,
+            load_kind: AudioLoadKind::Replace,
+            load_ticket: 0,
+            audition_ticket: 0,
+            load_browser: None,
             follow_playhead_suspended: false,
             pending_loads: VecDeque::new(),
             selected_marker: None,
@@ -115,6 +146,9 @@ impl TinySamplerApp {
             selected_track: None,
             screen: AppScreen::Library,
             persist,
+            sound_library_dir: settings.sound_library_dir,
+            settings_open: false,
+            settings_browse: crate::browser::default_audio_dir(),
             sampler_track: None,
             sampler_view_start: 0.0,
             sampler_view_len: 1.0,
@@ -123,6 +157,9 @@ impl TinySamplerApp {
             sampler_active_pad: None,
             piano_pad_held: None,
             sampler_base_secs: 0.0,
+            studio_base_secs: 0.0,
+            studio_base_scroll_px: 0.0,
+            studio_transport_paused: false,
             startup_maximize_after: 2,
         })
     }
@@ -149,32 +186,96 @@ impl TinySamplerApp {
         self.seek_pending.store(true, Ordering::Release);
     }
 
+    /// Space: start or resume, or stop if already playing.
+    pub(crate) fn transport_on_space(&mut self) {
+        let playing = self.current_project().transport.is_playing;
+        if playing {
+            self.transport_stop();
+        } else {
+            self.transport_toggle_play_pause();
+        }
+    }
+
+    /// Ctrl+Space: freeze the playhead. Does nothing when playback is already stopped.
+    pub(crate) fn transport_pause(&mut self) {
+        let mut p = (*self.current_project()).clone();
+        if !p.transport.is_playing {
+            return;
+        }
+        p.transport.is_playing = false;
+        self.studio_transport_paused = true;
+        self.publish(p);
+    }
+
     pub(crate) fn transport_toggle_play_pause(&mut self) {
         let mut p = (*self.current_project()).clone();
-        p.transport.is_playing = !p.transport.is_playing;
+        if p.transport.is_playing {
+            p.transport.is_playing = false;
+            self.studio_transport_paused = true;
+            self.publish(p);
+            return;
+        }
+        if !self.studio_transport_paused {
+            self.capture_studio_base();
+        }
+        self.studio_transport_paused = false;
+        p.transport.is_playing = true;
         self.publish(p);
     }
 
     pub(crate) fn transport_stop(&mut self) {
         let mut p = (*self.current_project()).clone();
+        let restore_view = p.transport.is_playing || self.studio_transport_paused;
+        let return_to = self.studio_return_secs();
         p.transport.is_playing = false;
         p.transport.stop_generation = p.transport.stop_generation.wrapping_add(1);
-        self.publish(p);
-        self.timeline_scroll_px = 0.0;
+        p.transport.stop_return_secs = return_to;
         self.seek_pending.store(false, Ordering::Release);
+        self.publish(p);
+        self.studio_transport_paused = false;
+        self.playhead_bits
+            .store(return_to.to_bits(), Ordering::Relaxed);
+        if restore_view {
+            self.timeline_scroll_px = self.studio_base_scroll_px.max(0.0);
+        }
         self.follow_playhead_suspended = false;
         self.marker_drag = None;
     }
 
-    fn try_pick_and_load_audio(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Audio", &["wav", "mp3"])
-            .add_filter("WAV", &["wav"])
-            .add_filter("MP3", &["mp3"])
-            .pick_file()
-        {
-            self.enqueue_audio_path(path);
+    fn capture_studio_base(&mut self) {
+        let t = self.playhead_secs();
+        self.studio_base_secs = if t.is_finite() { t.max(0.0) } else { 0.0 };
+        self.studio_base_scroll_px = self.timeline_scroll_px.max(0.0);
+    }
+
+    fn studio_return_secs(&self) -> f32 {
+        let t = self.studio_base_secs;
+        if t.is_finite() {
+            t.max(0.0)
+        } else {
+            0.0
         }
+    }
+
+    /// Move the studio playhead. While fully stopped, this also moves the return cursor.
+    pub(crate) fn seek_studio(&mut self, secs: f32) {
+        let t = if secs.is_finite() { secs.max(0.0) } else { 0.0 };
+        let playing = self.current_project().transport.is_playing;
+        if !playing && !self.studio_transport_paused {
+            self.studio_base_secs = t;
+        }
+        self.request_seek(t);
+        self.playhead_bits.store(t.to_bits(), Ordering::Relaxed);
+    }
+
+    fn open_load_browser(&mut self, append: bool) {
+        let dir = self.sound_library_dir.clone();
+        self.load_browser = Some(LoadBrowser::open(append, dir.as_deref()));
+    }
+
+    fn close_load_browser(&mut self) {
+        self.load_browser = None;
+        self.stop_browser_playback();
     }
 
     fn is_supported_audio_path(path: &std::path::Path) -> bool {
@@ -187,17 +288,26 @@ impl TinySamplerApp {
             .unwrap_or(false)
     }
 
-    fn enqueue_audio_path(&mut self, path: PathBuf) {
+    fn enqueue_audio_path(&mut self, path: PathBuf, kind: AudioLoadKind) {
         if !Self::is_supported_audio_path(&path) {
-            self.status = format!(
-                "unsupported audio format (use WAV or MP3): {}",
+            let msg = format!(
+                "Нужен WAV или MP3: {}",
                 path.file_name()
                     .and_then(|n| n.to_str())
-                    .unwrap_or("file")
+                    .unwrap_or("файл")
             );
+            self.status = msg;
             return;
         }
-        self.pending_loads.push_back(path);
+        self.pending_loads.push_back(PendingAudio {
+            path,
+            kind,
+            audition_ticket: if kind == AudioLoadKind::Audition {
+                self.audition_ticket
+            } else {
+                0
+            },
+        });
         self.start_next_load_if_idle();
     }
 
@@ -205,11 +315,14 @@ impl TinySamplerApp {
         if self.load_rx.is_some() {
             return;
         }
-        let Some(path) = self.pending_loads.pop_front() else {
+        let Some(pending) = self.pending_loads.pop_front() else {
             return;
         };
         let (tx, rx) = mpsc::channel();
         self.load_rx = Some(rx);
+        self.load_kind = pending.kind;
+        self.load_ticket = pending.audition_ticket;
+        let path = pending.path;
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -242,7 +355,7 @@ impl TinySamplerApp {
                 .collect()
         });
         for path in dropped {
-            self.enqueue_audio_path(path);
+            self.enqueue_audio_path(path, AudioLoadKind::Append);
         }
     }
 
@@ -264,31 +377,86 @@ impl TinySamplerApp {
         self.load_rx = None;
         match outcome {
             Some(Ok((sample, label))) => {
+                if self.load_kind == AudioLoadKind::Audition {
+                    if self.load_browser.is_some() && self.load_ticket == self.audition_ticket {
+                        self.start_file_audition(sample, label);
+                    }
+                    self.start_next_load_if_idle();
+                    return;
+                }
+                let append = self.load_kind == AudioLoadKind::Append;
                 let mut p = (*self.current_project()).clone();
                 let track = self.sampler_track.or(self.selected_track);
                 if let Some(track) = track {
-                    let n = sample.data.len() as f32;
-                    project_actions::set_track_sample(&mut p, track, sample, label.clone());
-                    self.sampler_view_start = 0.0;
-                    self.sampler_view_len = n.max(1.0);
-                    self.sampler_selected_pad = None;
-                    self.sampler_pad_drag = None;
-                    self.sampler_active_pad = None;
-                    self.sampler_base_secs = 0.0;
-                    p.sampler_preview.playing = false;
-                    p.sampler_preview.end_secs = None;
-                    self.engine.reset_preview_secs();
-                    let name = p
-                        .track(track)
-                        .map(|t| t.name.clone())
-                        .unwrap_or_else(|| "трек".into());
-                    self.status = format!("{label} → {name}");
-                    self.publish(p);
+                    let had_sample = p.track(track).and_then(|t| t.sample.as_ref()).is_some();
+                    if append && had_sample {
+                        match project_actions::append_track_sample(&mut p, track, sample, label.clone())
+                        {
+                            Ok(added) => {
+                                let slot = project_actions::bind_next_pad_range(
+                                    &mut p,
+                                    track,
+                                    added.start_index,
+                                    added.end_index,
+                                );
+                                self.sampler_view_start = added.start_index as f32;
+                                self.sampler_view_len =
+                                    (added.end_index - added.start_index).max(1) as f32;
+                                self.status = append_status(&label, slot, added.resampled);
+                                self.publish(p);
+                            }
+                            Err(e) => self.status = e,
+                        }
+                    } else {
+                        let n = sample.data.len() as f32;
+                        project_actions::set_track_sample(&mut p, track, sample, label.clone());
+                        self.sampler_view_start = 0.0;
+                        self.sampler_view_len = n.max(1.0);
+                        self.sampler_selected_pad = None;
+                        self.sampler_pad_drag = None;
+                        self.sampler_active_pad = None;
+                        self.sampler_base_secs = 0.0;
+                        p.sampler_preview.playing = false;
+                        p.sampler_preview.end_secs = None;
+                        self.engine.reset_preview_secs();
+                        if append {
+                            let end = n as usize;
+                            let slot =
+                                project_actions::bind_next_pad_range(&mut p, track, 0, end);
+                            let name = p
+                                .track(track)
+                                .map(|t| t.name.clone())
+                                .unwrap_or_else(|| "трек".into());
+                            self.status = match slot {
+                                Some(slot) => format!(
+                                    "{label} → {name} · пэд {}",
+                                    sampler::PAD_LABELS[slot as usize]
+                                ),
+                                None => format!("{label} → {name}"),
+                            };
+                        } else {
+                            let name = p
+                                .track(track)
+                                .map(|t| t.name.clone())
+                                .unwrap_or_else(|| "трек".into());
+                            self.status = format!("{label} → {name}");
+                        }
+                        self.publish(p);
+                    }
                 } else {
                     self.status = "Сначала добавьте трек в студии.".into();
                 }
             }
-            Some(Err(e)) => self.status = e,
+            Some(Err(e)) => {
+                if self.load_kind == AudioLoadKind::Audition
+                    && self.load_ticket == self.audition_ticket
+                {
+                    if let Some(browser) = &mut self.load_browser {
+                        browser.playing = None;
+                    }
+                }
+                self.status = e;
+            }
             None => self.status = "Загрузка прервалась.".into(),
         }
         self.start_next_load_if_idle();
@@ -307,6 +475,10 @@ impl TinySamplerApp {
     }
 
     fn handle_global_shortcuts(&mut self, ctx: &egui::Context) {
+        if self.load_browser.is_some() {
+            self.handle_browser_shortcuts(ctx);
+            return;
+        }
         if ctx.wants_keyboard_input() {
             return;
         }
@@ -330,7 +502,7 @@ impl TinySamplerApp {
             } else if space {
                 self.sampler_toggle_preview();
             } else if open_wav {
-                self.try_pick_and_load_audio();
+                self.open_load_browser(true);
             } else if save {
                 self.persist_now(true);
             } else if delete_pad {
@@ -358,9 +530,9 @@ impl TinySamplerApp {
             } else if delete {
                 self.delete_selected_note();
             } else if ctrl_space {
-                self.transport_stop();
+                self.transport_pause();
             } else if space {
-                self.transport_toggle_play_pause();
+                self.transport_on_space();
             } else if save {
                 self.persist_now(true);
             }
@@ -390,11 +562,11 @@ impl TinySamplerApp {
                 )
             });
         if ctrl_space {
-            self.transport_stop();
+            self.transport_pause();
         } else if space {
-            self.transport_toggle_play_pause();
+            self.transport_on_space();
         } else if open_wav {
-            self.try_pick_and_load_audio();
+            self.open_load_browser(false);
         } else if save {
             self.persist_now(true);
         } else if delete_clip {
@@ -436,6 +608,9 @@ impl TinySamplerApp {
         let Some(t) = project_actions::marker_time(&self.current_project(), slot, track) else {
             return;
         };
+        self.studio_base_secs = t;
+        self.studio_base_scroll_px = self.timeline_scroll_px.max(0.0);
+        self.studio_transport_paused = false;
         self.request_seek(t);
         self.playhead_bits.store(t.to_bits(), Ordering::Relaxed);
         self.follow_playhead_suspended = false;
@@ -510,6 +685,9 @@ impl TinySamplerApp {
         self.sampler_active_pad = None;
         self.piano_pad_held = None;
         self.sampler_base_secs = 0.0;
+        self.studio_base_secs = 0.0;
+        self.studio_base_scroll_px = 0.0;
+        self.studio_transport_paused = false;
         self.status.clear();
         self.request_seek(0.0);
         self.playhead_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
@@ -519,6 +697,10 @@ impl TinySamplerApp {
         self.transport_stop();
         self.close_seq_editor();
         self.close_sampler();
+        if self.load_browser.is_some() {
+            self.close_load_browser();
+        }
+        self.settings_open = false;
         self.persist_now(false);
         self.persist.close_without_save();
         self.publish(Project::empty());
@@ -826,6 +1008,7 @@ impl TinySamplerApp {
         if stop_transport {
             p.transport.is_playing = false;
         }
+        p.audition.playing = false;
         p.sampler_preview.playing = true;
         p.sampler_preview.start_secs = start_secs;
         p.sampler_preview.end_secs = end_secs;
@@ -920,6 +1103,77 @@ impl TinySamplerApp {
         }
     }
 
+    fn reorder_sampler_slice(&mut self, from: usize, to: usize) {
+        let Some(track) = self.sampler_track else {
+            return;
+        };
+        let cursor = self.sampler_cursor_sample_index(track);
+        let mut p = (*self.current_project()).clone();
+        let old = p
+            .track(track)
+            .map(|t| t.sample_slices.clone())
+            .unwrap_or_default();
+        if !project_actions::reorder_track_slice(&mut p, track, from, to) {
+            return;
+        }
+        let mapped = cursor.map(|idx| {
+            project_actions::sample_index_after_slice_reorder(&old, from, to, idx)
+        });
+        self.finish_slice_edit(p, track, mapped);
+    }
+
+    fn delete_sampler_slice(&mut self, index: usize) {
+        let Some(track) = self.sampler_track else {
+            return;
+        };
+        let cursor = self.sampler_cursor_sample_index(track);
+        let mut p = (*self.current_project()).clone();
+        let old = p
+            .track(track)
+            .map(|t| t.sample_slices.clone())
+            .unwrap_or_default();
+        if !project_actions::delete_track_slice(&mut p, track, index) {
+            return;
+        }
+        let mapped = cursor.and_then(|idx| {
+            project_actions::sample_index_after_slice_delete(&old, index, idx)
+        });
+        self.finish_slice_edit(p, track, mapped);
+    }
+
+    fn finish_slice_edit(&mut self, mut project: Project, track: TrackId, cursor: Option<usize>) {
+        if let Some(slot) = self.sampler_selected_pad {
+            let kept = project
+                .track(track)
+                .is_some_and(|t| t.pad_markers.iter().any(|m| m.slot == slot));
+            if !kept {
+                self.sampler_selected_pad = None;
+            }
+        }
+        self.sampler_active_pad = None;
+        project.sampler_preview.playing = false;
+        project.sampler_preview.end_secs = None;
+        let secs = match cursor {
+            Some(idx) => {
+                let rate = project
+                    .track(track)
+                    .and_then(|t| t.sample.as_ref())
+                    .map(|s| s.rate())
+                    .unwrap_or(1);
+                let speed = project.track_speed(track);
+                project_actions::sample_index_to_preview_secs(idx, rate, speed)
+            }
+            None => 0.0,
+        };
+        self.sampler_base_secs = secs;
+        if project.sample_len(track) == 0 {
+            self.sampler_view_start = 0.0;
+            self.sampler_view_len = 1.0;
+        }
+        self.engine.seek_preview_secs(secs);
+        self.publish(project);
+    }
+
     fn delete_sampler_pad(&mut self, slot: u8) {
         let Some(track) = self.sampler_track else {
             return;
@@ -989,7 +1243,8 @@ impl TinySamplerApp {
             sampler::SamplerAction::TogglePreview => self.sampler_toggle_preview(),
             sampler::SamplerAction::PitchDelta(d) => self.sampler_nudge_pitch(d),
             sampler::SamplerAction::TempoDelta(d) => self.sampler_nudge_tempo(d),
-            sampler::SamplerAction::LoadFile => self.try_pick_and_load_audio(),
+            sampler::SamplerAction::LoadFile => self.open_load_browser(false),
+            sampler::SamplerAction::AddSounds => self.open_load_browser(true),
             sampler::SamplerAction::SeekCursor { sample_index } => {
                 self.seek_sampler_cursor(sample_index);
             }
@@ -1009,6 +1264,8 @@ impl TinySamplerApp {
                 }
             }
             sampler::SamplerAction::DeletePad { slot } => self.delete_sampler_pad(slot),
+            sampler::SamplerAction::ReorderSlice { from, to } => self.reorder_sampler_slice(from, to),
+            sampler::SamplerAction::DeleteSlice { index } => self.delete_sampler_slice(index),
             sampler::SamplerAction::SelectPad { slot } => {
                 self.sampler_selected_pad = slot;
             }
@@ -1080,6 +1337,7 @@ impl TinySamplerApp {
         let tempo_bpm = proj.tempo_bpm;
         let speed = track.playback_speed();
         let mut preview_playing = proj.sampler_preview.playing;
+        let audition_playing = proj.audition.playing;
         let preview_end = proj.sampler_preview.end_secs;
         let sample_buf = track.sample.as_ref().map(|s| {
             (
@@ -1089,6 +1347,7 @@ impl TinySamplerApp {
             )
         });
         let pad_markers = track.pad_markers.clone();
+        let sample_slices = track.sample_slices.clone();
         drop(proj);
         if preview_playing {
             if let Some(end) = preview_end {
@@ -1101,7 +1360,7 @@ impl TinySamplerApp {
                 }
             }
         }
-        if !preview_playing {
+        if !preview_playing && !audition_playing {
             self.engine
                 .seek_preview_secs(self.sampler_base_secs_clamped());
         }
@@ -1122,6 +1381,7 @@ impl TinySamplerApp {
             speed,
             status: &status,
             pad_markers: &pad_markers,
+            slices: &sample_slices,
             selected_pad: self.sampler_selected_pad,
             active_pad: self.sampler_active_pad,
         };
@@ -1136,6 +1396,187 @@ impl TinySamplerApp {
             self.apply_sampler_action(action);
         }
     }
+
+    fn publish_live(&mut self, project: Project) {
+        self.project_swap.store(Arc::new(project));
+    }
+
+    fn start_file_audition(&mut self, sample: crate::model::Sample, label: String) {
+        let end = sample.data.len() as f32 / sample.rate() as f32;
+        let mut p = (*self.current_project()).clone();
+        p.sampler_preview.playing = false;
+        p.sampler_preview.end_secs = None;
+        p.audition.sample = Some(sample);
+        p.audition.label = label;
+        p.audition.end_secs = end.max(0.0);
+        p.audition.playing = true;
+        p.audition.generation = p.audition.generation.wrapping_add(1);
+        self.sampler_active_pad = None;
+        self.engine.seek_preview_secs(0.0);
+        self.publish_live(p);
+    }
+
+    fn cancel_pending_audition(&mut self) {
+        self.audition_ticket = self.audition_ticket.wrapping_add(1);
+    }
+
+    fn audition_load_pending(&self) -> bool {
+        let inflight = self.load_rx.is_some()
+            && self.load_kind == AudioLoadKind::Audition
+            && self.load_ticket == self.audition_ticket;
+        let queued = self
+            .pending_loads
+            .iter()
+            .any(|job| job.kind == AudioLoadKind::Audition && job.audition_ticket == self.audition_ticket);
+        inflight || queued
+    }
+
+    fn stop_browser_playback(&mut self) {
+        self.cancel_pending_audition();
+        if let Some(browser) = &mut self.load_browser {
+            browser.playing = None;
+        }
+        let mut p = (*self.current_project()).clone();
+        let audition = p.audition.playing;
+        let preview = p.sampler_preview.playing;
+        if !audition && !preview {
+            return;
+        }
+        p.audition.playing = false;
+        p.sampler_preview.playing = false;
+        p.sampler_preview.end_secs = None;
+        self.sampler_active_pad = None;
+        if preview {
+            self.publish(p);
+        } else {
+            self.publish_live(p);
+        }
+        if self.sampler_track.is_some() {
+            self.engine
+                .seek_preview_secs(self.sampler_base_secs_clamped());
+        }
+    }
+
+    fn handle_browser_shortcuts(&mut self, ctx: &egui::Context) {
+        let (escape, space) = ctx.input(|i| {
+            (
+                i.key_pressed(Key::Escape),
+                i.key_pressed(Key::Space) && !i.modifiers.ctrl,
+            )
+        });
+        if escape {
+            self.close_load_browser();
+        } else if space {
+            self.browser_space();
+        }
+    }
+
+    fn browser_space(&mut self) {
+        let Some(browser) = &self.load_browser else {
+            return;
+        };
+        if browser.playing.is_some() {
+            self.stop_browser_playback();
+            return;
+        }
+        let Some(index) = browser.selected else {
+            return;
+        };
+        let path = match browser.rows.get(index) {
+            Some(browser::BrowserRow::Sound { path, .. }) => path.clone(),
+            _ => return,
+        };
+        self.play_browser_file(path);
+    }
+
+    fn play_browser_file(&mut self, path: PathBuf) {
+        self.cancel_pending_audition();
+        if let Some(browser) = &mut self.load_browser {
+            browser.playing = Some(path.clone());
+        }
+        self.enqueue_audio_path(path, AudioLoadKind::Audition);
+    }
+
+    fn sync_browser_playback(&mut self) {
+        if self
+            .load_browser
+            .as_ref()
+            .and_then(|b| b.playing.as_ref())
+            .is_none()
+        {
+            return;
+        }
+        let proj = self.current_project();
+        let audition_on = proj.audition.playing;
+        let audition_end = proj.audition.end_secs;
+        drop(proj);
+        if !audition_on || !audition_end.is_finite() || self.engine.preview_secs() < audition_end {
+            return;
+        }
+        if self.audition_load_pending() {
+            let mut p = (*self.current_project()).clone();
+            p.audition.playing = false;
+            self.publish_live(p);
+        } else {
+            self.stop_file_audition_ui();
+        }
+    }
+
+    fn stop_file_audition_ui(&mut self) {
+        if let Some(browser) = &mut self.load_browser {
+            browser.playing = None;
+        }
+        let mut p = (*self.current_project()).clone();
+        if p.audition.playing {
+            p.audition.playing = false;
+            self.publish_live(p);
+        }
+    }
+
+    fn show_load_browser(&mut self, ctx: &egui::Context) {
+        self.sync_browser_playback();
+        let Some(browser) = &mut self.load_browser else {
+            return;
+        };
+        let action = browser::show(ctx, browser);
+        let Some(action) = action else {
+            return;
+        };
+        match action {
+            BrowserAction::Close => self.close_load_browser(),
+            BrowserAction::Stop => self.stop_browser_playback(),
+            BrowserAction::PlayFile(path) => self.play_browser_file(path),
+            BrowserAction::AddFile(path) => {
+                let append = self
+                    .load_browser
+                    .as_ref()
+                    .map(|b| b.append)
+                    .unwrap_or(true);
+                self.enqueue_audio_path(
+                    path,
+                    if append {
+                        AudioLoadKind::Append
+                    } else {
+                        AudioLoadKind::Replace
+                    },
+                );
+            }
+        }
+    }
+}
+
+fn append_status(label: &str, slot: Option<u8>, resampled: bool) -> String {
+    let mut status = match slot {
+        Some(slot) => format!(
+            "{label} добавлен после текущих · пэд {}",
+            sampler::PAD_LABELS[slot as usize]
+        ),
+        None => format!("{label} добавлен после текущих · свободных пэдов нет"),
+    };
+    if resampled {
+        status.push_str(" · частота приведена к треку");
+    }
+    status
 }
 
 fn marker_slot_from_keys(i: &egui::InputState) -> Option<u8> {
@@ -1198,6 +1639,12 @@ impl eframe::App for TinySamplerApp {
         }
         if self.seq_editor.is_some() {
             self.show_piano_roll_modal(ctx);
+        }
+        if self.load_browser.is_some() {
+            self.show_load_browser(ctx);
+        }
+        if self.settings_open && self.screen == AppScreen::Studio {
+            self.show_settings_window(ctx);
         }
 
         ctx.request_repaint_after(std::time::Duration::from_millis(33));

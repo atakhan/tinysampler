@@ -65,7 +65,13 @@ impl Sample {
     }
 }
 
-/// Which edge of a pad region is being dragged.
+/// One source file laid into the track buffer, back to back with the others.
+#[derive(Clone, Debug)]
+pub struct SampleSlice {
+    pub label: String,
+    pub start_index: usize,
+    pub end_index: usize,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PadEdge {
     Start,
@@ -91,6 +97,8 @@ pub struct Track {
     /// Instrument buffer (one per track). Timeline sound comes from notes, not this clip.
     pub sample: Option<Sample>,
     pub sample_label: String,
+    /// Source files concatenated in [`Self::sample`], in order.
+    pub sample_slices: Vec<SampleSlice>,
     /// Sample chops in the instrument; slot `0` is top-left pad (Q).
     pub pad_markers: Vec<PadMarker>,
 }
@@ -125,11 +133,35 @@ impl Default for SamplerPreview {
     }
 }
 
+/// A WAV/MP3 being auditioned from the load window. Not part of the document.
+#[derive(Clone)]
+pub struct FileAudition {
+    pub sample: Option<Sample>,
+    pub label: String,
+    pub playing: bool,
+    pub generation: u64,
+    pub end_secs: f32,
+}
+
+impl Default for FileAudition {
+    fn default() -> Self {
+        Self {
+            sample: None,
+            label: String::new(),
+            playing: false,
+            generation: 0,
+            end_secs: 0.0,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Transport {
     pub is_playing: bool,
-    /// Incremented on Stop so the audio thread resets playhead to 0.
+    /// Incremented on Stop so the audio thread jumps the playhead to [`Self::stop_return_secs`].
     pub stop_generation: u64,
+    /// Playhead position applied when `stop_generation` changes (the pre-play cursor).
+    pub stop_return_secs: f32,
 }
 
 impl Default for Transport {
@@ -137,6 +169,7 @@ impl Default for Transport {
         Self {
             is_playing: false,
             stop_generation: 0,
+            stop_return_secs: 0.0,
         }
     }
 }
@@ -168,6 +201,8 @@ pub struct Project {
     pub tempo_bpm: f32,
     /// Preview inside the sampling instrument (takes over the output while playing).
     pub sampler_preview: SamplerPreview,
+    /// File audition for the load window. Not written to disk.
+    pub audition: FileAudition,
 }
 
 impl Project {
@@ -184,6 +219,7 @@ impl Project {
             next_track_id: 1,
             tempo_bpm: 120.0,
             sampler_preview: SamplerPreview::default(),
+            audition: FileAudition::default(),
         }
     }
 

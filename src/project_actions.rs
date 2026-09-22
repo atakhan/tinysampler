@@ -1,9 +1,11 @@
 //! Mutations of [`crate::model::Project`] (invariants for tracks, pads, sequences, notes).
 
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::model::{
-    CueMarker, NoteId, PadEdge, PadMarker, PadNote, Project, Sample, SeqClip, SeqId, Track, TrackId,
+    CueMarker, NoteId, PadEdge, PadMarker, PadNote, Project, Sample, SampleSlice, SeqClip, SeqId,
+    Track, TrackId,
 };
 use crate::time::{self, default_seq_duration_secs, grid_step_secs, snap_time_floor, snap_time_round};
 use crate::wav_loader;
@@ -17,6 +19,7 @@ pub fn add_track(project: &mut Project) -> TrackId {
         pitch_semitones: 0,
         sample: None,
         sample_label: String::new(),
+        sample_slices: Vec::new(),
         pad_markers: Vec::new(),
     });
     let duration = default_seq_duration_secs(project.tempo_bpm);
@@ -34,9 +37,15 @@ pub fn set_track_sample(project: &mut Project, track_id: TrackId, sample: Sample
     let Some(track) = project.track_mut(track_id) else {
         return;
     };
+    let end = sample.data.len();
     track.pad_markers.clear();
     track.sample = Some(sample);
-    track.sample_label = label;
+    track.sample_label = label.clone();
+    track.sample_slices = vec![SampleSlice {
+        label,
+        start_index: 0,
+        end_index: end,
+    }];
     let drop_seq: Vec<SeqId> = project
         .seq_clips
         .iter()
@@ -50,6 +59,319 @@ pub fn append_audio_clip(project: &mut Project, sample: Sample, label: String) -
     let track_id = add_track(project);
     set_track_sample(project, track_id, sample, label);
     track_id
+}
+
+/// A file appended onto an existing instrument buffer.
+pub struct AppendedSample {
+    pub start_index: usize,
+    pub end_index: usize,
+    pub resampled: bool,
+}
+
+/// Place `sample` after the audio already on the track. Pads and notes stay.
+pub fn append_track_sample(
+    project: &mut Project,
+    track_id: TrackId,
+    sample: Sample,
+    label: String,
+) -> Result<AppendedSample, String> {
+    let (dst_rate, resampled, start, end, data) = {
+        let Some(track) = project.track(track_id) else {
+            return Err("трек не найден".into());
+        };
+        let Some(existing) = track.sample.as_ref() else {
+            return Err("на треке ещё нет сэмпла".into());
+        };
+        let dst_rate = existing.rate();
+        let resampled = sample.rate() != dst_rate;
+        let incoming = wav_loader::resample_mono(sample.data.as_slice(), sample.rate(), dst_rate)?;
+        let start = existing.data.len();
+        let end = start.saturating_add(incoming.len());
+        if end > wav_loader::MAX_MONO_SAMPLES {
+            return Err("сэмпл слишком длинный".into());
+        }
+        let mut data = existing.data.as_ref().clone();
+        data.extend_from_slice(&incoming);
+        (dst_rate, resampled, start, end, data)
+    };
+    let peaks = crate::waveform::PeakPyramid::build(&data);
+    let Some(track) = project.track_mut(track_id) else {
+        return Err("трек не найден".into());
+    };
+    track.sample = Some(Sample::new_mono(Arc::new(data), Arc::new(peaks), dst_rate));
+    track.sample_slices.push(SampleSlice {
+        label,
+        start_index: start,
+        end_index: end,
+    });
+    track.sample_label = sample_slices_label(&track.sample_slices);
+    Ok(AppendedSample {
+        start_index: start,
+        end_index: end,
+        resampled,
+    })
+}
+
+/// Bind the next free pad to an exact sample range. `None` when every pad is taken.
+pub fn bind_next_pad_range(
+    project: &mut Project,
+    track_id: TrackId,
+    start_index: usize,
+    end_index: usize,
+) -> Option<u8> {
+    if end_index <= start_index {
+        return None;
+    }
+    let track = project.track_mut(track_id)?;
+    let slot = (0u8..PAD_SLOT_COUNT).find(|&s| !track.pad_markers.iter().any(|m| m.slot == s))?;
+    track.pad_markers.push(PadMarker {
+        slot,
+        start_index,
+        end_index,
+    });
+    Some(slot)
+}
+
+/// Move one source file to another slot. The pieces stay back to back, with no overlap.
+pub fn reorder_track_slice(
+    project: &mut Project,
+    track_id: TrackId,
+    from: usize,
+    to: usize,
+) -> bool {
+    let Some(track) = project.track(track_id) else {
+        return false;
+    };
+    let n = track.sample_slices.len();
+    if from >= n || to >= n || from == to {
+        return false;
+    }
+    let mut order: Vec<usize> = (0..n).collect();
+    let item = order.remove(from);
+    order.insert(to, item);
+    rebuild_slices(project, track_id, &order)
+}
+
+/// Drop one source file and close the gap. Pads that lived only inside it go away.
+pub fn delete_track_slice(project: &mut Project, track_id: TrackId, index: usize) -> bool {
+    let Some(track) = project.track(track_id) else {
+        return false;
+    };
+    let n = track.sample_slices.len();
+    if index >= n {
+        return false;
+    }
+    if n == 1 {
+        return clear_track_sample(project, track_id);
+    }
+    let order: Vec<usize> = (0..n).filter(|&i| i != index).collect();
+    rebuild_slices(project, track_id, &order)
+}
+
+/// Where a sample index lands after [`reorder_track_slice`].
+pub fn sample_index_after_slice_reorder(
+    slices: &[SampleSlice],
+    from: usize,
+    to: usize,
+    index: usize,
+) -> usize {
+    let n = slices.len();
+    if from >= n || to >= n || from == to {
+        return index;
+    }
+    let mut order: Vec<usize> = (0..n).collect();
+    let item = order.remove(from);
+    order.insert(to, item);
+    map_index_through_order(slices, &order, index, false).unwrap_or(0)
+}
+
+/// Where a sample index lands after [`delete_track_slice`]. `None` when no audio remains.
+pub fn sample_index_after_slice_delete(
+    slices: &[SampleSlice],
+    index: usize,
+    sample_index: usize,
+) -> Option<usize> {
+    let n = slices.len();
+    if index >= n {
+        return Some(sample_index);
+    }
+    if n == 1 {
+        return None;
+    }
+    let order: Vec<usize> = (0..n).filter(|&i| i != index).collect();
+    map_index_through_order(slices, &order, sample_index, false)
+}
+
+fn clear_track_sample(project: &mut Project, track_id: TrackId) -> bool {
+    let Some(track) = project.track_mut(track_id) else {
+        return false;
+    };
+    let slots: Vec<u8> = track.pad_markers.iter().map(|m| m.slot).collect();
+    track.sample = None;
+    track.sample_label.clear();
+    track.sample_slices.clear();
+    track.pad_markers.clear();
+    for slot in slots {
+        forget_pad_notes(project, track_id, slot);
+    }
+    true
+}
+
+fn rebuild_slices(project: &mut Project, track_id: TrackId, order: &[usize]) -> bool {
+    let Some(track) = project.track(track_id) else {
+        return false;
+    };
+    let Some(sample) = track.sample.as_ref() else {
+        return false;
+    };
+    let old = track.sample_slices.clone();
+    if order.len() > old.len() || order.iter().any(|&i| i >= old.len()) {
+        return false;
+    }
+    let rate = sample.rate();
+    let data = sample.data.clone();
+    let pads = track.pad_markers.clone();
+    let (new_data, new_slices, origin) = place_slice_order(data.as_slice(), &old, order);
+    let mut kept = Vec::new();
+    let mut dropped = Vec::new();
+    for pad in pads {
+        match (
+            map_index_with_origin(&old, &origin, pad.start_index, false),
+            map_index_with_origin(&old, &origin, pad.end_index, true),
+        ) {
+            (Some(start), Some(end)) if end > start => {
+                kept.push(PadMarker {
+                    slot: pad.slot,
+                    start_index: start,
+                    end_index: end,
+                });
+            }
+            _ => dropped.push(pad.slot),
+        }
+    }
+    let peaks = crate::waveform::PeakPyramid::build(&new_data);
+    let Some(track) = project.track_mut(track_id) else {
+        return false;
+    };
+    track.sample = Some(Sample::new_mono(Arc::new(new_data), Arc::new(peaks), rate));
+    track.sample_slices = new_slices;
+    track.sample_label = sample_slices_label(&track.sample_slices);
+    track.pad_markers = kept;
+    for slot in dropped {
+        forget_pad_notes(project, track_id, slot);
+    }
+    true
+}
+
+fn place_slice_order(
+    data: &[f32],
+    old: &[SampleSlice],
+    order: &[usize],
+) -> (Vec<f32>, Vec<SampleSlice>, Vec<Option<(usize, usize)>>) {
+    let mut origin = vec![None; old.len()];
+    let mut new_data = Vec::new();
+    let mut new_slices = Vec::new();
+    for &old_i in order {
+        let slice = &old[old_i];
+        let start = slice.start_index.min(data.len());
+        let end = slice.end_index.min(data.len()).max(start);
+        let new_start = new_data.len();
+        new_data.extend_from_slice(&data[start..end]);
+        let len = end - start;
+        origin[old_i] = Some((new_start, len));
+        new_slices.push(SampleSlice {
+            label: slice.label.clone(),
+            start_index: new_start,
+            end_index: new_start + len,
+        });
+    }
+    (new_data, new_slices, origin)
+}
+
+fn map_index_through_order(
+    old: &[SampleSlice],
+    order: &[usize],
+    index: usize,
+    exclusive_end: bool,
+) -> Option<usize> {
+    let mut origin = vec![None; old.len()];
+    let mut cursor = 0usize;
+    for &old_i in order {
+        let len = old
+            .get(old_i)
+            .map(|s| s.end_index.saturating_sub(s.start_index))
+            .unwrap_or(0);
+        origin[old_i] = Some((cursor, len));
+        cursor += len;
+    }
+    map_index_with_origin(old, &origin, index, exclusive_end)
+}
+
+fn map_index_with_origin(
+    old: &[SampleSlice],
+    origin: &[Option<(usize, usize)>],
+    index: usize,
+    exclusive_end: bool,
+) -> Option<usize> {
+    if old.is_empty() {
+        return Some(0);
+    }
+    let (slice_i, mut off) = if exclusive_end && index > 0 {
+        let (i, inner) = locate_slice(old, index - 1);
+        (i, inner + 1)
+    } else {
+        locate_slice(old, index)
+    };
+    let (new_start, len) = origin.get(slice_i).copied().flatten()?;
+    off = off.min(len);
+    Some(new_start + off)
+}
+
+fn locate_slice(slices: &[SampleSlice], index: usize) -> (usize, usize) {
+    for (i, slice) in slices.iter().enumerate() {
+        if index < slice.end_index {
+            return (i, index.saturating_sub(slice.start_index));
+        }
+    }
+    let last = slices.len().saturating_sub(1);
+    let len = slices
+        .get(last)
+        .map(|s| s.end_index.saturating_sub(s.start_index))
+        .unwrap_or(0);
+    (last, len)
+}
+
+fn forget_pad_notes(project: &mut Project, track_id: TrackId, slot: u8) {
+    let drop_seq: Vec<SeqId> = project
+        .seq_clips
+        .iter()
+        .filter(|s| s.track_id == track_id)
+        .map(|s| s.id)
+        .collect();
+    project
+        .notes
+        .retain(|note| note.slot != slot || !drop_seq.contains(&note.seq_id));
+}
+
+fn sample_slices_label(slices: &[SampleSlice]) -> String {
+    if slices.len() <= 1 {
+        return slices
+            .first()
+            .map(|s| s.label.clone())
+            .unwrap_or_default();
+    }
+    let mut label = String::new();
+    for (i, slice) in slices.iter().enumerate() {
+        if i > 0 {
+            label.push_str(" + ");
+        }
+        if label.len() > 48 {
+            label.push('…');
+            break;
+        }
+        label.push_str(&slice.label);
+    }
+    label
 }
 
 pub fn load_audio_file(path: &Path) -> Result<(Sample, String), String> {
@@ -514,6 +836,80 @@ mod tests {
         assert_eq!(p.tracks.len(), 1);
         assert_eq!(p.tracks[0].sample_label, "b");
         assert!(p.tracks[0].sample.is_some());
+        assert_eq!(p.tracks[0].sample_slices.len(), 1);
+        assert_eq!(p.tracks[0].sample_slices[0].label, "b");
+    }
+
+    #[test]
+    fn append_track_sample_places_the_next_sound_after_the_current_one() {
+        let mut p = Project::empty();
+        let id = add_track(&mut p);
+        set_track_sample(&mut p, id, dummy_sample(), "kick.wav".into());
+        assert!(bind_next_pad_range(&mut p, id, 0, 64).is_some());
+        let added = append_track_sample(&mut p, id, dummy_sample(), "snare.wav".into()).unwrap();
+        assert_eq!(added.start_index, 64);
+        assert_eq!(added.end_index, 128);
+        assert!(!added.resampled);
+        let track = &p.tracks[0];
+        assert_eq!(track.sample.as_ref().unwrap().data.len(), 128);
+        assert_eq!(track.sample_slices.len(), 2);
+        assert_eq!(track.sample_slices[1].label, "snare.wav");
+        assert_eq!(track.pad_markers.len(), 1);
+        let slot = bind_next_pad_range(&mut p, id, added.start_index, added.end_index);
+        assert_eq!(slot, Some(1));
+        assert_eq!(p.tracks[0].pad_markers[1].start_index, 64);
+        assert_eq!(p.tracks[0].pad_markers[1].end_index, 128);
+    }
+
+    fn tone(n: usize, v: f32) -> Sample {
+        let data = vec![v; n];
+        let peaks = crate::waveform::PeakPyramid::build(&data);
+        Sample::new_mono(Arc::new(data), Arc::new(peaks), 48_000)
+    }
+
+    #[test]
+    fn reorder_keeps_files_back_to_back_and_moves_their_pads() {
+        let mut p = Project::empty();
+        let id = add_track(&mut p);
+        set_track_sample(&mut p, id, tone(4, 0.25), "a.wav".into());
+        append_track_sample(&mut p, id, tone(2, 0.5), "b.wav".into()).unwrap();
+        append_track_sample(&mut p, id, tone(3, 0.75), "c.wav".into()).unwrap();
+        assert!(bind_next_pad_range(&mut p, id, 4, 6).is_some());
+        assert!(reorder_track_slice(&mut p, id, 2, 0));
+        let track = &p.tracks[0];
+        let data = track.sample.as_ref().unwrap().data.as_slice();
+        assert_eq!(data, &[0.75, 0.75, 0.75, 0.25, 0.25, 0.25, 0.25, 0.5, 0.5]);
+        assert_eq!(track.sample_slices[0].label, "c.wav");
+        assert_eq!(track.sample_slices[0].end_index, 3);
+        assert_eq!(track.sample_slices[1].start_index, 3);
+        assert_eq!(track.sample_slices[2].start_index, 7);
+        assert_eq!(track.sample_slices[2].end_index, data.len());
+        let pad = track.pad_markers.iter().find(|m| m.slot == 0).unwrap();
+        assert_eq!((pad.start_index, pad.end_index), (7, 9));
+    }
+
+    #[test]
+    fn delete_slice_closes_the_gap_and_drops_a_pad_that_lived_inside_it() {
+        let mut p = Project::empty();
+        let id = add_track(&mut p);
+        set_track_sample(&mut p, id, tone(4, 0.25), "a.wav".into());
+        append_track_sample(&mut p, id, tone(2, 0.5), "b.wav".into()).unwrap();
+        bind_next_pad_range(&mut p, id, 0, 4);
+        bind_next_pad_range(&mut p, id, 4, 6);
+        assert!(delete_track_slice(&mut p, id, 0));
+        let track = &p.tracks[0];
+        assert_eq!(track.sample.as_ref().unwrap().data.as_slice(), &[0.5, 0.5]);
+        assert_eq!(track.sample_slices.len(), 1);
+        assert_eq!(track.sample_slices[0].label, "b.wav");
+        assert_eq!(track.pad_markers.len(), 1);
+        assert_eq!(track.pad_markers[0].slot, 1);
+        assert_eq!(
+            (track.pad_markers[0].start_index, track.pad_markers[0].end_index),
+            (0, 2)
+        );
+        assert!(delete_track_slice(&mut p, id, 0));
+        assert!(p.tracks[0].sample.is_none());
+        assert!(p.tracks[0].pad_markers.is_empty());
     }
 
     #[test]
