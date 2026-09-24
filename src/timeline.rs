@@ -170,6 +170,12 @@ fn tempo_ruler_steps(pps: f32, bpm: f32) -> (f32, Option<f32>) {
     (major, minor)
 }
 
+/// Finest tempo line currently drawn at this zoom. Sausage edits snap to it.
+pub fn visible_grid_step(pps: f32, bpm: f32) -> f32 {
+    let (major, minor) = tempo_ruler_steps(pps, bpm);
+    minor.unwrap_or(major).max(1e-4)
+}
+
 fn format_tempo_label(t: f32, major_secs: f32, bpm: f32) -> String {
     let beat = beat_secs(bpm);
     let bar = beat * BEATS_PER_BAR;

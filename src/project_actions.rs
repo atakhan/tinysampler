@@ -7,7 +7,7 @@ use crate::model::{
     CueMarker, NoteId, PadEdge, PadMarker, PadNote, Project, Sample, SampleSlice, SeqClip, SeqId,
     Track, TrackId,
 };
-use crate::time::{self, default_seq_duration_secs, grid_step_secs, snap_time_floor, snap_time_round};
+use crate::time::{self, default_seq_duration_secs, grid_step_secs, snap_time_floor};
 use crate::wav_loader;
 
 pub fn add_track(project: &mut Project) -> TrackId {
@@ -678,40 +678,94 @@ pub fn move_pad_note(project: &mut Project, id: NoteId, start_time_secs: f32, sl
     if pad_marker_range(project, seq.track_id, slot).is_none() {
         return false;
     }
-    let step = grid_step_secs(project.tempo_bpm);
-    let start = snap_time_round(start_time_secs, step).clamp(0.0, (seq.duration_secs - step).max(0.0));
-    let Some(note) = project.notes.iter_mut().find(|n| n.id == id) else {
-        return false;
+    let start = start_time_secs.max(0.0);
+    let (seq_id, end) = {
+        let Some(note) = project.notes.iter_mut().find(|n| n.id == id) else {
+            return false;
+        };
+        if (note.start_time_secs - start).abs() < 1e-4 && note.slot == slot {
+            return false;
+        }
+        note.start_time_secs = start;
+        note.slot = slot;
+        (note.seq_id, start + note.duration_secs)
     };
-    if note.start_time_secs == start && note.slot == slot {
-        return false;
+    if let Some(seq) = project.seq_clips.iter_mut().find(|s| s.id == seq_id) {
+        if seq.duration_secs < end {
+            seq.duration_secs = end;
+        }
     }
-    note.start_time_secs = start;
-    note.slot = slot;
     true
 }
 
+/// Copy `id` to `start_time_secs` / `slot`. The source note is left where it was.
+pub fn duplicate_pad_note(
+    project: &mut Project,
+    id: NoteId,
+    start_time_secs: f32,
+    slot: u8,
+) -> Option<NoteId> {
+    if slot >= PAD_SLOT_COUNT {
+        return None;
+    }
+    let note = project.notes.iter().find(|n| n.id == id).copied()?;
+    let seq = project.seq_clips.iter().find(|s| s.id == note.seq_id).copied()?;
+    if pad_marker_range(project, seq.track_id, slot).is_none() {
+        return None;
+    }
+    let start = start_time_secs.max(0.0);
+    let new_id = project.alloc_note_id();
+    let end = start + note.duration_secs;
+    project.notes.push(PadNote {
+        id: new_id,
+        seq_id: note.seq_id,
+        slot,
+        start_time_secs: start,
+        duration_secs: note.duration_secs,
+    });
+    if let Some(seq) = project.seq_clips.iter_mut().find(|s| s.id == note.seq_id) {
+        if seq.duration_secs < end {
+            seq.duration_secs = end;
+        }
+    }
+    Some(new_id)
+}
+
 pub fn resize_pad_note(project: &mut Project, id: NoteId, end_time_secs: f32) -> bool {
-    let step = grid_step_secs(project.tempo_bpm).max(1e-4);
-    let Some(note) = project.notes.iter().find(|n| n.id == id).copied() else {
-        return false;
-    };
-    let max_end = project
-        .seq_clips
-        .iter()
-        .find(|s| s.id == note.seq_id)
-        .map(|s| s.duration_secs)
-        .unwrap_or(note.end_time_secs());
     let Some(note) = project.notes.iter_mut().find(|n| n.id == id) else {
         return false;
     };
-    let end = snap_time_round(end_time_secs, step)
-        .max(note.start_time_secs + step)
-        .min(max_end);
-    let duration = (end - note.start_time_secs).max(step);
-    if (note.duration_secs - duration).abs() < 1e-6 {
+    let start = note.start_time_secs;
+    let end = end_time_secs.max(start + MIN_NOTE_DURATION_SECS);
+    let duration = end - start;
+    if (note.duration_secs - duration).abs() < 1e-4 {
         return false;
     }
+    let seq_id = note.seq_id;
+    note.duration_secs = duration;
+    let grown = end;
+    if let Some(seq) = project.seq_clips.iter_mut().find(|s| s.id == seq_id) {
+        if seq.duration_secs < grown {
+            seq.duration_secs = grown;
+        }
+    }
+    true
+}
+
+/// Move the start and keep the end where it was, so the length changes from the left.
+pub fn resize_pad_note_start(project: &mut Project, id: NoteId, start_time_secs: f32) -> bool {
+    let Some(note) = project.notes.iter_mut().find(|n| n.id == id) else {
+        return false;
+    };
+    let end = note.end_time_secs();
+    let start = start_time_secs
+        .max(0.0)
+        .min(end - MIN_NOTE_DURATION_SECS);
+    let duration = end - start;
+    if (note.start_time_secs - start).abs() < 1e-4 && (note.duration_secs - duration).abs() < 1e-4 {
+        return false;
+    }
+    note.start_time_secs = start;
     note.duration_secs = duration;
     true
 }
@@ -748,50 +802,77 @@ pub fn add_seq_clip(project: &mut Project, track_id: TrackId, start_time_secs: f
 }
 
 pub fn move_seq_clip(project: &mut Project, id: SeqId, start_time_secs: f32) -> bool {
-    let step = grid_step_secs(project.tempo_bpm);
-    let start = snap_time_round(start_time_secs, step).max(0.0);
+    let start = start_time_secs.max(0.0);
     let Some(seq) = project.seq_clips.iter_mut().find(|s| s.id == id) else {
         return false;
     };
-    if (seq.start_time_secs - start).abs() < 1e-6 {
+    if (seq.start_time_secs - start).abs() < 1e-4 {
         return false;
     }
     seq.start_time_secs = start;
     true
 }
 
+/// Copy a sausage and every note inside it. Note times stay relative to the clip.
+pub fn duplicate_seq_clip(project: &mut Project, id: SeqId, start_time_secs: f32) -> Option<SeqId> {
+    let seq = project.seq_clips.iter().find(|s| s.id == id).copied()?;
+    let notes: Vec<_> = project
+        .notes
+        .iter()
+        .filter(|n| n.seq_id == id)
+        .copied()
+        .collect();
+    let new_id = project.alloc_seq_id();
+    project.seq_clips.push(SeqClip {
+        id: new_id,
+        track_id: seq.track_id,
+        start_time_secs: start_time_secs.max(0.0),
+        duration_secs: seq.duration_secs,
+    });
+    for note in notes {
+        let note_id = project.alloc_note_id();
+        project.notes.push(PadNote {
+            id: note_id,
+            seq_id: new_id,
+            ..note
+        });
+    }
+    Some(new_id)
+}
+
 pub fn resize_seq_end(project: &mut Project, id: SeqId, end_time_secs: f32) -> bool {
-    let step = grid_step_secs(project.tempo_bpm).max(1e-4);
     let Some(seq) = project.seq_clips.iter_mut().find(|s| s.id == id) else {
         return false;
     };
-    let end = snap_time_round(end_time_secs, step).max(seq.start_time_secs + step);
-    let duration = (end - seq.start_time_secs).max(step);
-    if (seq.duration_secs - duration).abs() < 1e-6 {
+    let end = end_time_secs.max(seq.start_time_secs + MIN_SEQ_DURATION_SECS);
+    let duration = end - seq.start_time_secs;
+    if (seq.duration_secs - duration).abs() < 1e-4 {
         return false;
     }
     seq.duration_secs = duration;
     true
 }
 
+const MIN_SEQ_DURATION_SECS: f32 = 0.05;
+const MIN_NOTE_DURATION_SECS: f32 = 0.001;
+
 pub fn resize_seq_start(project: &mut Project, id: SeqId, start_time_secs: f32) -> bool {
-    let step = grid_step_secs(project.tempo_bpm).max(1e-4);
     let Some(seq) = project.seq_clips.iter().find(|s| s.id == id).copied() else {
         return false;
     };
     let end = seq.end_time_secs();
-    let start = snap_time_round(start_time_secs, step)
+    let start = start_time_secs
         .max(0.0)
-        .min(end - step);
+        .min(end - MIN_SEQ_DURATION_SECS);
     let delta = start - seq.start_time_secs;
-    if delta.abs() < 1e-6 {
+    if delta.abs() < 1e-4 {
         return false;
     }
     let Some(seq) = project.seq_clips.iter_mut().find(|s| s.id == id) else {
         return false;
     };
     seq.start_time_secs = start;
-    seq.duration_secs = (end - start).max(step);
+    seq.duration_secs = (end - start).max(MIN_SEQ_DURATION_SECS);
     for note in project.notes.iter_mut().filter(|n| n.seq_id == id) {
         note.start_time_secs -= delta;
     }
@@ -1038,6 +1119,51 @@ mod tests {
         assert!(delete_seq_clip(&mut p, seq));
         assert!(p.seq_clips.is_empty());
         assert!(p.notes.is_empty());
+    }
+
+    #[test]
+    fn seq_and_note_resize_follow_the_pointer_inside_one_grid_step() {
+        let mut p = Project::empty();
+        p.tempo_bpm = 120.0;
+        let id = add_track(&mut p);
+        set_track_sample(&mut p, id, dummy_sample(), "a".into());
+        assert!(bind_pad_marker(&mut p, id, 0, 0, 64, 8));
+        let seq = seq_clip_on_track(&p, id).unwrap();
+        let before = p.seq_clips[0].duration_secs;
+        let end = p.seq_clips[0].end_time_secs();
+        assert!(resize_seq_end(&mut p, seq, end + 0.03));
+        assert!((p.seq_clips[0].duration_secs - before - 0.03).abs() < 1e-3);
+        let note_id = place_pad_note(&mut p, seq, 0, 0.0).unwrap();
+        let note_end = p.notes.iter().find(|n| n.id == note_id).unwrap().end_time_secs();
+        assert!(resize_pad_note(&mut p, note_id, note_end + 0.03));
+        let grown = p.notes.iter().find(|n| n.id == note_id).unwrap().end_time_secs();
+        assert!((grown - note_end - 0.03).abs() < 1e-3);
+        assert!(resize_pad_note(&mut p, note_id, 1.0));
+        assert!(resize_pad_note_start(&mut p, note_id, 0.2));
+        let note = p.notes.iter().find(|n| n.id == note_id).unwrap();
+        assert!((note.start_time_secs - 0.2).abs() < 1e-3);
+        assert!((note.end_time_secs() - 1.0).abs() < 1e-3);
+        let original = note.start_time_secs;
+        let duration = note.duration_secs;
+        let copy = duplicate_pad_note(&mut p, note_id, 1.5, 0).unwrap();
+        assert_ne!(copy, note_id);
+        let source = p.notes.iter().find(|n| n.id == note_id).unwrap();
+        assert!((source.start_time_secs - original).abs() < 1e-3);
+        assert!((source.duration_secs - duration).abs() < 1e-3);
+        let copied = p.notes.iter().find(|n| n.id == copy).unwrap();
+        assert!((copied.start_time_secs - 1.5).abs() < 1e-3);
+        assert!((copied.duration_secs - duration).abs() < 1e-3);
+        let seq = p.notes.iter().find(|n| n.id == note_id).unwrap().seq_id;
+        let original_start = p.seq_clips.iter().find(|s| s.id == seq).unwrap().start_time_secs;
+        let copy_seq = duplicate_seq_clip(&mut p, seq, 3.0).unwrap();
+        assert_ne!(copy_seq, seq);
+        assert_eq!(p.notes.iter().filter(|n| n.seq_id == seq).count(), 2);
+        assert_eq!(p.notes.iter().filter(|n| n.seq_id == copy_seq).count(), 2);
+        assert!(
+            (p.seq_clips.iter().find(|s| s.id == seq).unwrap().start_time_secs - original_start).abs()
+                < 1e-3
+        );
+        assert!((p.seq_clips.iter().find(|s| s.id == copy_seq).unwrap().start_time_secs - 3.0).abs() < 1e-3);
     }
 
     #[test]

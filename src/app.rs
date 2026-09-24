@@ -39,6 +39,7 @@ pub(crate) struct PendingAudio {
 #[derive(Clone, Copy)]
 pub(crate) enum SeqDrag {
     Move { id: SeqId, grab_offset_secs: f32 },
+    Copy { source: SeqId, grab_offset_secs: f32 },
     ResizeStart { id: SeqId },
     ResizeEnd { id: SeqId },
 }
@@ -57,7 +58,8 @@ pub struct TinySamplerApp {
     pub(crate) selected_seq: Option<SeqId>,
     pub(crate) seq_editor: Option<SeqId>,
     pub(crate) seq_view_start: f32,
-    pub(crate) seq_view_len: f32,
+    /// Horizontal zoom of the piano roll. `0` means “fit the sequence on the next frame”.
+    pub(crate) seq_pps: f32,
     pub(crate) seq_note_drag: Option<pianoroll::NoteDrag>,
     pub(crate) seq_drag: Option<SeqDrag>,
     pub(crate) load_rx: Option<Receiver<Result<(crate::model::Sample, String), String>>>,
@@ -134,7 +136,7 @@ impl TinySamplerApp {
             selected_seq: None,
             seq_editor: None,
             seq_view_start: 0.0,
-            seq_view_len: 1.0,
+            seq_pps: 0.0,
             seq_note_drag: None,
             seq_drag: None,
             load_rx: None,
@@ -762,7 +764,7 @@ impl TinySamplerApp {
         self.selected_seq = Some(id);
         self.selected_track = Some(seq.track_id);
         self.seq_view_start = 0.0;
-        self.seq_view_len = seq.duration_secs.max(0.25);
+        self.seq_pps = 0.0;
         self.seq_note_drag = None;
         self.selected_note = None;
         self.seq_drag = None;
@@ -782,12 +784,18 @@ impl TinySamplerApp {
         let Some(id) = self.selected_seq else {
             return;
         };
+        self.delete_seq(id);
+    }
+
+    pub(crate) fn delete_seq(&mut self, id: crate::model::SeqId) {
         if self.seq_editor == Some(id) {
             self.close_seq_editor();
         }
         let mut p = (*self.current_project()).clone();
         if project_actions::delete_seq_clip(&mut p, id) {
-            self.selected_seq = None;
+            if self.selected_seq == Some(id) {
+                self.selected_seq = None;
+            }
             self.seq_drag = None;
             self.publish(p);
         }
@@ -830,10 +838,42 @@ impl TinySamplerApp {
                     self.publish(p);
                 }
             }
+            pianoroll::PianoRollAction::DuplicateNote {
+                source,
+                slot,
+                time,
+                grab_offset_secs,
+            } => {
+                let mut p = (*self.current_project()).clone();
+                match project_actions::duplicate_pad_note(&mut p, source, time, slot) {
+                    Some(id) => {
+                        self.selected_note = Some(id);
+                        self.seq_note_drag = Some(pianoroll::NoteDrag::Move {
+                            id,
+                            grab_offset_secs,
+                        });
+                        self.status.clear();
+                        self.publish(p);
+                    }
+                    None => {
+                        let label = sampler::PAD_LABELS.get(slot as usize).copied().unwrap_or("?");
+                        self.status = format!("Сначала нарежьте пэд {label} в инструменте сэмплинга");
+                    }
+                }
+            }
+            pianoroll::PianoRollAction::ResizeNoteStart { id, start } => {
+                let mut p = (*self.current_project()).clone();
+                let changed = project_actions::resize_pad_note_start(&mut p, id, start);
+                self.selected_note = Some(id);
+                if changed {
+                    self.publish(p);
+                }
+            }
             pianoroll::PianoRollAction::ResizeNote { id, end } => {
                 let mut p = (*self.current_project()).clone();
-                if project_actions::resize_pad_note(&mut p, id, end) {
-                    self.selected_note = Some(id);
+                let changed = project_actions::resize_pad_note(&mut p, id, end);
+                self.selected_note = Some(id);
+                if changed {
                     self.publish(p);
                 }
             }
@@ -857,6 +897,15 @@ impl TinySamplerApp {
         };
         let track_name = track.name.clone();
         let tempo_bpm = proj.tempo_bpm;
+        let speed = track.playback_speed();
+        let sample_hold = track.sample.as_ref().map(|sample| {
+            (
+                Arc::clone(&sample.data),
+                Arc::clone(&sample.peaks),
+                sample.rate(),
+                speed,
+            )
+        });
         let pad_markers = track.pad_markers.clone();
         let notes: Vec<_> = proj
             .notes
@@ -880,12 +929,14 @@ impl TinySamplerApp {
             ctx.request_repaint();
         }
         let playhead_local = if playing {
-            let t = self.playhead_secs() - seq.start_time_secs;
-            (t >= 0.0 && t <= seq.duration_secs).then_some(t)
+            Some(self.playhead_secs() - seq.start_time_secs)
         } else {
             None
         };
         let status = self.status.clone();
+        let sample = sample_hold
+            .as_ref()
+            .map(|(data, peaks, rate, speed)| (data.as_slice(), peaks.as_ref(), *rate, *speed));
         let model = pianoroll::PianoRollModel {
             track_name: &track_name,
             tempo_bpm,
@@ -896,12 +947,13 @@ impl TinySamplerApp {
             playhead_local,
             active_pad: self.sampler_active_pad,
             status: &status,
+            sample,
         };
         let action = pianoroll::show(
             ctx,
             model,
             &mut self.seq_view_start,
-            &mut self.seq_view_len,
+            &mut self.seq_pps,
             &mut self.seq_note_drag,
         );
         if let Some(action) = action {

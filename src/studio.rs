@@ -327,17 +327,44 @@ impl TinySamplerApp {
                                 let t =
                                     (((pos.x - view_left) + self.timeline_scroll_px) / pps).max(0.0);
                                 let mut p = (*self.current_project()).clone();
+                                let step = timeline::visible_grid_step(pps, p.tempo_bpm);
                                 let changed = match drag {
                                     SeqDrag::Move {
                                         id,
                                         grab_offset_secs,
-                                    } => project_actions::move_seq_clip(&mut p, id, t - grab_offset_secs),
-                                    SeqDrag::ResizeStart { id } => {
-                                        project_actions::resize_seq_start(&mut p, id, t)
+                                    } => project_actions::move_seq_clip(
+                                        &mut p,
+                                        id,
+                                        snap_studio_time(t - grab_offset_secs, step),
+                                    ),
+                                    SeqDrag::Copy {
+                                        source,
+                                        grab_offset_secs,
+                                    } => {
+                                        let start = snap_studio_time(t - grab_offset_secs, step);
+                                        if let Some(new_id) = project_actions::duplicate_seq_clip(
+                                            &mut p, source, start,
+                                        ) {
+                                            self.selected_seq = Some(new_id);
+                                            self.seq_drag = Some(SeqDrag::Move {
+                                                id: new_id,
+                                                grab_offset_secs,
+                                            });
+                                            true
+                                        } else {
+                                            false
+                                        }
                                     }
-                                    SeqDrag::ResizeEnd { id } => {
-                                        project_actions::resize_seq_end(&mut p, id, t)
-                                    }
+                                    SeqDrag::ResizeStart { id } => project_actions::resize_seq_start(
+                                        &mut p,
+                                        id,
+                                        snap_studio_time(t, step),
+                                    ),
+                                    SeqDrag::ResizeEnd { id } => project_actions::resize_seq_end(
+                                        &mut p,
+                                        id,
+                                        snap_studio_time(t, step),
+                                    ),
                                 };
                                 if changed {
                                     self.publish(p);
@@ -403,6 +430,7 @@ impl TinySamplerApp {
                                         self.seq_drag = Some(SeqDrag::ResizeEnd { id });
                                     }
                                     pianoroll::SeqHit::Body => {
+                                        let alt = ctx.input(|i| i.modifiers.alt);
                                         let start = proj_now
                                             .seq_clips
                                             .iter()
@@ -412,9 +440,17 @@ impl TinySamplerApp {
                                         let t = (((pos.x - view_left) + self.timeline_scroll_px)
                                             / pps)
                                             .max(0.0);
-                                        self.seq_drag = Some(SeqDrag::Move {
-                                            id,
-                                            grab_offset_secs: t - start,
+                                        let grab_offset_secs = t - start;
+                                        self.seq_drag = Some(if alt {
+                                            SeqDrag::Copy {
+                                                source: id,
+                                                grab_offset_secs,
+                                            }
+                                        } else {
+                                            SeqDrag::Move {
+                                                id,
+                                                grab_offset_secs,
+                                            }
                                         });
                                     }
                                 }
@@ -442,9 +478,11 @@ impl TinySamplerApp {
                     } else if self.seq_drag.is_some() {
                         ctx.set_cursor_icon(match self.seq_drag {
                             Some(SeqDrag::Move { .. }) => CursorIcon::Grabbing,
+                            Some(SeqDrag::Copy { .. }) => CursorIcon::Alias,
                             _ => CursorIcon::ResizeHorizontal,
                         });
                     } else if let Some(hp) = ctx.pointer_hover_pos() {
+                        let alt = ctx.input(|i| i.modifiers.alt);
                         if let Some((_, _, on_delete)) = timeline::marker_hit_at_pointer(
                             &proj,
                             hp,
@@ -467,6 +505,7 @@ impl TinySamplerApp {
                             self.timeline_scroll_px,
                         ) {
                             ctx.set_cursor_icon(match hit {
+                                pianoroll::SeqHit::Body if alt => CursorIcon::Alias,
                                 pianoroll::SeqHit::Body => CursorIcon::Move,
                                 _ => CursorIcon::ResizeHorizontal,
                             });
@@ -477,7 +516,25 @@ impl TinySamplerApp {
                         }
                     }
 
-                    if pan_resp.double_clicked() {
+                    let right_delete = if ctx.input(|i| i.pointer.secondary_clicked()) {
+                        ctx.input(|i| i.pointer.hover_pos()).and_then(|pos| {
+                            pianoroll::hit_seq(
+                                &proj,
+                                pos,
+                                &layout,
+                                view_left,
+                                pps,
+                                self.timeline_scroll_px,
+                            )
+                            .map(|(id, _)| id)
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(id) = right_delete {
+                        drop(proj);
+                        self.delete_seq(id);
+                    } else if pan_resp.double_clicked() {
                         if let Some(p) = pan_resp.interact_pointer_pos() {
                             let sc = self.timeline_scroll_px;
                             if let Some((id, _)) =
@@ -1013,4 +1070,8 @@ fn paint_studio_base_cursor(painter: &egui::Painter, rect: Rect, x: f32, ruler: 
             Stroke::NONE,
         ));
     }
+}
+
+fn snap_studio_time(t: f32, step: f32) -> f32 {
+    crate::time::snap_time_round(t.max(0.0), step)
 }
