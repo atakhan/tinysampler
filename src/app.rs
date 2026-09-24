@@ -89,6 +89,9 @@ pub struct TinySamplerApp {
     /// Pause froze the playhead away from [`Self::studio_base_secs`].
     pub(crate) studio_transport_paused: bool,
     pub(crate) startup_maximize_after: u8,
+    pub(crate) sampler_tempo_rx: Option<Receiver<(u64, crate::musical_time::MusicalTimeAnalysis)>>,
+    pub(crate) sampler_tempo_gen: u64,
+    pub(crate) sampler_tempo: sampler::TempoDetectState,
 }
 
 impl TinySamplerApp {
@@ -161,6 +164,9 @@ impl TinySamplerApp {
             studio_base_scroll_px: 0.0,
             studio_transport_paused: false,
             startup_maximize_after: 2,
+            sampler_tempo_rx: None,
+            sampler_tempo_gen: 0,
+            sampler_tempo: sampler::TempoDetectState::default(),
         })
     }
 
@@ -930,6 +936,7 @@ impl TinySamplerApp {
         p.sampler_preview.end_secs = None;
         self.publish(p);
         self.engine.reset_preview_secs();
+        self.clear_tempo_detect();
     }
 
     fn close_sampler(&mut self) {
@@ -947,6 +954,116 @@ impl TinySamplerApp {
         p.sampler_preview.end_secs = None;
         self.publish(p);
         self.engine.reset_preview_secs();
+        self.clear_tempo_detect();
+    }
+
+    fn clear_tempo_detect(&mut self) {
+        self.sampler_tempo_gen = self.sampler_tempo_gen.wrapping_add(1);
+        self.sampler_tempo_rx = None;
+        self.sampler_tempo = sampler::TempoDetectState::default();
+    }
+
+    fn start_tempo_detect(&mut self) {
+        let Some(track_id) = self.sampler_track else {
+            return;
+        };
+        let proj = self.current_project();
+        let Some(sample) = proj.track(track_id).and_then(|t| t.sample.as_ref()) else {
+            return;
+        };
+        let data = Arc::clone(&sample.data);
+        let rate = sample.rate();
+        let len = data.len();
+        drop(proj);
+        self.sampler_tempo_gen = self.sampler_tempo_gen.wrapping_add(1);
+        let generation = self.sampler_tempo_gen;
+        let (tx, rx) = mpsc::channel();
+        self.sampler_tempo_rx = Some(rx);
+        self.sampler_tempo.running = true;
+        self.sampler_tempo.message = "Считаю темп…".into();
+        self.sampler_tempo.detail.clear();
+        self.sampler_tempo.alternatives.clear();
+        self.sampler_tempo.beats.clear();
+        self.sampler_tempo.downbeats.clear();
+        self.sampler_tempo.bpm = None;
+        self.sampler_tempo.sample_len = len;
+        std::thread::spawn(move || {
+            let analysis = crate::musical_time::analyze(
+                &data,
+                rate,
+                crate::musical_time::AnalysisMode::Deep,
+            );
+            let _ = tx.send((generation, analysis));
+        });
+    }
+
+    fn poll_tempo_detect(&mut self) {
+        let received = self.sampler_tempo_rx.as_ref().and_then(|rx| match rx.try_recv() {
+            Ok(message) => Some(Ok(message)),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => Some(Err(())),
+        });
+        match received {
+            Some(Ok((generation, analysis))) => {
+                self.sampler_tempo_rx = None;
+                if generation == self.sampler_tempo_gen && self.sampler_track.is_some() {
+                    self.finish_tempo_detect(analysis);
+                } else {
+                    self.sampler_tempo.running = false;
+                }
+            }
+            Some(Err(())) => {
+                self.sampler_tempo_rx = None;
+                self.sampler_tempo.running = false;
+                if self.sampler_tempo.message == "Считаю темп…" {
+                    self.sampler_tempo.message = "Анализ прервался".into();
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn finish_tempo_detect(&mut self, analysis: crate::musical_time::MusicalTimeAnalysis) {
+        let current_len = self
+            .sampler_track
+            .and_then(|id| self.current_project().track(id).and_then(|t| t.sample.as_ref()).map(|s| s.data.len()));
+        self.sampler_tempo.running = false;
+        if current_len != Some(self.sampler_tempo.sample_len) {
+            self.sampler_tempo.message = "Сэмпл изменился во время анализа".into();
+            return;
+        }
+        self.sampler_tempo.bpm = analysis.tempo.bpm;
+        self.sampler_tempo.confidence = analysis.tempo.confidence;
+        self.sampler_tempo.beats = analysis.beats.iter().map(|beat| beat.time_secs).collect();
+        self.sampler_tempo.downbeats = analysis.downbeats.iter().map(|beat| beat.time_secs).collect();
+        let chosen = analysis.tempo.bpm;
+        self.sampler_tempo.alternatives = analysis
+            .tempo
+            .alternatives
+            .iter()
+            .filter(|candidate| {
+                chosen
+                    .map(|bpm| (candidate.bpm - bpm).abs() > 0.4)
+                    .unwrap_or(true)
+            })
+            .take(4)
+            .map(|candidate| sampler::DetectedTempo {
+                bpm: candidate.bpm,
+                confidence: candidate.confidence,
+            })
+            .collect();
+        self.sampler_tempo.message = tempo_detect_message(&analysis);
+        self.sampler_tempo.detail = analysis.diagnostics.notes.join("\n");
+        if let Some(bpm) = analysis.tempo.bpm {
+            self.apply_detected_tempo(bpm);
+        }
+    }
+
+    fn apply_detected_tempo(&mut self, bpm: f32) {
+        let mut project = (*self.current_project()).clone();
+        if project_actions::set_tempo(&mut project, bpm) {
+            self.publish(project);
+        }
     }
 
     fn sampler_base_secs_clamped(&self) -> f32 {
@@ -1270,6 +1387,8 @@ impl TinySamplerApp {
                 self.sampler_selected_pad = slot;
             }
             sampler::SamplerAction::TriggerPad { slot } => self.trigger_sampler_pad(slot),
+            sampler::SamplerAction::DetectTempo => self.start_tempo_detect(),
+            sampler::SamplerAction::ApplyTempo(bpm) => self.apply_detected_tempo(bpm),
         }
     }
 
@@ -1323,6 +1442,7 @@ impl TinySamplerApp {
     }
 
     fn show_sampler_modal(&mut self, ctx: &egui::Context) {
+        self.poll_tempo_detect();
         let Some(track_id) = self.sampler_track else {
             return;
         };
@@ -1366,6 +1486,17 @@ impl TinySamplerApp {
         }
         let status = self.status.clone();
         let sample_rate = sample_buf.as_ref().map(|(_, _, r)| *r).unwrap_or(1);
+        if let Some((data, _, _)) = &sample_buf {
+            if !self.sampler_tempo.running
+                && self.sampler_tempo.sample_len != 0
+                && self.sampler_tempo.sample_len != data.len()
+            {
+                self.sampler_tempo = sampler::TempoDetectState::default();
+            }
+        }
+        if self.sampler_tempo.running {
+            ctx.request_repaint();
+        }
         let sample = sample_buf
             .as_ref()
             .map(|(data, peaks, _)| (data.as_slice(), peaks.as_ref()));
@@ -1384,6 +1515,7 @@ impl TinySamplerApp {
             slices: &sample_slices,
             selected_pad: self.sampler_selected_pad,
             active_pad: self.sampler_active_pad,
+            tempo_detect: &self.sampler_tempo,
         };
         let action = sampler::show(
             ctx,
@@ -1652,5 +1784,30 @@ impl eframe::App for TinySamplerApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.persist_open_on_exit();
+    }
+}
+
+fn tempo_detect_message(analysis: &crate::musical_time::MusicalTimeAnalysis) -> String {
+    if let Some(bpm) = analysis.tempo.bpm {
+        format!(
+            "{} · уверенность {:.0}%",
+            crate::time::format_bpm(bpm),
+            analysis.tempo.confidence * 100.0
+        )
+    } else if let Some(reason) = analysis.tempo.unknown_reason {
+        format!("Темп не определён: {}", unknown_reason_ru(reason))
+    } else {
+        "Темп не определён".into()
+    }
+}
+
+fn unknown_reason_ru(reason: crate::musical_time::UnknownReason) -> &'static str {
+    use crate::musical_time::UnknownReason;
+    match reason {
+        UnknownReason::InsufficientPeriodicity => "недостаточно периодичности",
+        UnknownReason::LowRhythmicity => "слабый ритм",
+        UnknownReason::InsufficientDuration => "слишком короткий фрагмент",
+        UnknownReason::AmbiguousTempo => "неоднозначный темп",
+        UnknownReason::Silent => "тишина",
     }
 }

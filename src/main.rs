@@ -5,6 +5,7 @@ mod audio;
 mod library;
 mod mix;
 mod model;
+mod musical_time;
 mod persist;
 mod pianoroll;
 mod project_actions;

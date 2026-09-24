@@ -203,7 +203,7 @@ pub fn show(
                 ui.label(egui::RichText::new(model.track_name).strong().size(16.0));
                 ui.separator();
                 ui.label(
-                    egui::RichText::new(format!("{:.0} BPM", model.tempo_bpm))
+                    egui::RichText::new(crate::time::format_bpm(model.tempo_bpm))
                         .monospace()
                         .size(14.0),
                 );

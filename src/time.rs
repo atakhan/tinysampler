@@ -2,6 +2,15 @@
 
 pub const BEATS_PER_BAR: f32 = 4.0;
 
+pub fn format_bpm(tempo_bpm: f32) -> String {
+    let rounded = (tempo_bpm * 10.0).round() / 10.0;
+    if (rounded - rounded.round()).abs() < 0.05 {
+        format!("{rounded:.0} BPM")
+    } else {
+        format!("{rounded:.1} BPM")
+    }
+}
+
 pub fn beat_secs(tempo_bpm: f32) -> f32 {
     60.0 / tempo_bpm.clamp(20.0, 400.0)
 }

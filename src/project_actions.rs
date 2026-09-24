@@ -384,6 +384,18 @@ pub fn load_audio_file(path: &Path) -> Result<(Sample, String), String> {
     Ok((sample, label))
 }
 
+pub fn set_tempo(project: &mut Project, bpm: f32) -> bool {
+    if !bpm.is_finite() {
+        return false;
+    }
+    let next = ((bpm * 10.0).round() / 10.0).clamp(20.0, 400.0);
+    if (next - project.tempo_bpm).abs() < 1e-4 {
+        return false;
+    }
+    project.tempo_bpm = next;
+    true
+}
+
 pub fn nudge_tempo(project: &mut Project, delta: f32) -> bool {
     let next = (project.tempo_bpm + delta).clamp(20.0, 400.0);
     if (next - project.tempo_bpm).abs() < 1e-6 {
@@ -1034,5 +1046,15 @@ mod tests {
         p.tempo_bpm = 120.0;
         assert!(nudge_tempo(&mut p, -10.0));
         assert!((p.tempo_bpm - 110.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn set_tempo_rounds_and_clamps() {
+        let mut p = Project::empty();
+        assert!(set_tempo(&mut p, 97.44));
+        assert!((p.tempo_bpm - 97.4).abs() < 1e-4);
+        assert!(set_tempo(&mut p, 12.0));
+        assert!((p.tempo_bpm - 20.0).abs() < 1e-4);
+        assert!(!set_tempo(&mut p, f32::NAN));
     }
 }

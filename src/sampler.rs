@@ -6,6 +6,7 @@ use egui::{
 
 use crate::model::{PadEdge, PadMarker, SampleSlice};
 use crate::theme;
+use crate::time;
 use crate::waveform::{self, PeakPyramid};
 
 pub const PAD_COUNT: usize = 16;
@@ -46,6 +47,7 @@ pub struct SamplerModel<'a> {
     pub slices: &'a [SampleSlice],
     pub selected_pad: Option<u8>,
     pub active_pad: Option<u8>,
+    pub tempo_detect: &'a TempoDetectState,
 }
 
 pub enum SamplerAction {
@@ -67,6 +69,28 @@ pub enum SamplerAction {
     /// Move file `from` so it occupies slot `to`. Files stay contiguous.
     ReorderSlice { from: usize, to: usize },
     DeleteSlice { index: usize },
+    DetectTempo,
+    ApplyTempo(f32),
+}
+
+/// Last tempo-detection pass for the sampling instrument. Not part of the project file.
+#[derive(Clone, Debug, Default)]
+pub struct DetectedTempo {
+    pub bpm: f32,
+    pub confidence: f32,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TempoDetectState {
+    pub running: bool,
+    pub bpm: Option<f32>,
+    pub confidence: f32,
+    pub alternatives: Vec<DetectedTempo>,
+    pub message: String,
+    pub detail: String,
+    pub beats: Vec<f32>,
+    pub downbeats: Vec<f32>,
+    pub sample_len: usize,
 }
 
 pub fn pad_slot_from_keys(i: &egui::InputState) -> Option<u8> {
@@ -184,7 +208,7 @@ pub fn show(
                     action = Some(SamplerAction::TempoDelta(-1.0));
                 }
                 ui.label(
-                    egui::RichText::new(format!("{:.0} BPM", model.tempo_bpm))
+                    egui::RichText::new(time::format_bpm(model.tempo_bpm))
                         .monospace()
                         .size(14.0),
                 );
@@ -209,6 +233,10 @@ pub fn show(
                     }
                 });
             });
+            ui.add_space(6.0);
+            if let Some(detect_action) = show_tempo_detect(ui, &model) {
+                action = Some(detect_action);
+            }
             ui.add_space(8.0);
 
             let sample_n = model.sample.map(|(d, _)| d.len() as f32).unwrap_or(0.0);
@@ -285,6 +313,56 @@ pub fn show(
     if !open {
         action = Some(SamplerAction::Close);
     }
+    action
+}
+
+fn show_tempo_detect(ui: &mut egui::Ui, model: &SamplerModel<'_>) -> Option<SamplerAction> {
+    let mut action = None;
+    let detect = model.tempo_detect;
+    egui::Frame::none()
+        .fill(Color32::from_rgb(36, 42, 52))
+        .stroke(Stroke::new(1.0_f32, theme::color_timeline_border()))
+        .rounding(6.0)
+        .inner_margin(8.0)
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("Темп сэмпла").weak());
+                let enabled = model.sample.is_some() && !detect.running;
+                let label = if detect.running { "Detect BPM…" } else { "Detect BPM" };
+                if ui
+                    .add_enabled(
+                        enabled,
+                        egui::Button::new(egui::RichText::new(label).color(Color32::WHITE))
+                            .fill(theme::color_transport_load())
+                            .min_size(Vec2::new(118.0, 28.0)),
+                    )
+                    .on_hover_text("Найти BPM сэмпла и подставить его в темп проекта. Соседние варианты можно выбрать отдельно.")
+                    .clicked()
+                {
+                    action = Some(SamplerAction::DetectTempo);
+                }
+                if !detect.message.is_empty() {
+                    let msg = ui.label(egui::RichText::new(&detect.message).monospace());
+                    if !detect.detail.is_empty() {
+                        msg.on_hover_text(&detect.detail);
+                    }
+                }
+                for alt in &detect.alternatives {
+                    let text = time::format_bpm(alt.bpm);
+                    if ui
+                        .small_button(&text)
+                        .on_hover_text(format!(
+                            "Поставить {text} (уверенность {:.0}%)",
+                            alt.confidence * 100.0
+                        ))
+                        .clicked()
+                    {
+                        action = Some(SamplerAction::ApplyTempo(alt.bpm));
+                    }
+                }
+            });
+        });
     action
 }
 
@@ -834,6 +912,7 @@ fn paint_main_wave(
             theme::color_clip_zero_line(),
         );
         paint_slice_boundaries(&painter, rect, model.slices, view_start, view_len, true);
+        paint_detected_beats(&painter, rect, model, view_start, view_len);
         paint_pad_markers(&painter, rect, model, view_start, view_len);
         paint_cursors(&painter, rect, view_start, view_len.max(1.0), model);
         let _ = n;
@@ -844,6 +923,68 @@ fn paint_main_wave(
             "waveform сэмпла",
             FontId::proportional(16.0),
             Color32::from_gray(120),
+        );
+    }
+}
+
+fn paint_detected_beats(
+    painter: &egui::Painter,
+    rect: Rect,
+    model: &SamplerModel<'_>,
+    view_start: f32,
+    view_len: f32,
+) {
+    if model.sample_rate == 0 || view_len <= 1.0 {
+        return;
+    }
+    let view_end = view_start + view_len;
+    let beat_col = Color32::from_rgba_unmultiplied(120, 190, 255, 110);
+    let down_col = Color32::from_rgba_unmultiplied(255, 196, 120, 180);
+    paint_time_lines(
+        painter,
+        rect,
+        &model.tempo_detect.beats,
+        model.sample_rate,
+        view_start,
+        view_end,
+        view_len,
+        beat_col,
+        1.0,
+    );
+    paint_time_lines(
+        painter,
+        rect,
+        &model.tempo_detect.downbeats,
+        model.sample_rate,
+        view_start,
+        view_end,
+        view_len,
+        down_col,
+        1.6,
+    );
+}
+
+fn paint_time_lines(
+    painter: &egui::Painter,
+    rect: Rect,
+    times: &[f32],
+    sample_rate: u32,
+    view_start: f32,
+    view_end: f32,
+    view_len: f32,
+    color: Color32,
+    width: f32,
+) {
+    let rate = sample_rate as f32;
+    for time in times {
+        let idx = time * rate;
+        if idx < view_start || idx > view_end {
+            continue;
+        }
+        let x = rect.left() + (idx - view_start) / view_len * rect.width();
+        painter.line_segment(
+            [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+            Stroke::new(width, color),
         );
     }
 }

@@ -85,7 +85,7 @@ impl TinySamplerApp {
                         ui.add_space(16.0);
                         let bpm = self.current_project().tempo_bpm;
                         ui.label(
-                            egui::RichText::new(format!("{bpm:.0} BPM"))
+                            egui::RichText::new(crate::time::format_bpm(bpm))
                                 .weak()
                                 .size(14.0),
                         );
