@@ -10,6 +10,42 @@ use crate::model::{
 use crate::time::{self, default_seq_duration_secs, grid_step_secs, snap_time_floor};
 use crate::wav_loader;
 
+pub fn rename_track(project: &mut Project, track_id: TrackId, name: &str) -> bool {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let Some(track) = project.track_mut(track_id) else {
+        return false;
+    };
+    if track.name == trimmed {
+        return false;
+    }
+    track.name = trimmed.to_string();
+    true
+}
+
+pub fn delete_track(project: &mut Project, track_id: TrackId) -> bool {
+    if project.track_index(track_id).is_none() {
+        return false;
+    }
+    let seq_ids: Vec<SeqId> = project
+        .seq_clips
+        .iter()
+        .filter(|s| s.track_id == track_id)
+        .map(|s| s.id)
+        .collect();
+    project.notes.retain(|n| !seq_ids.contains(&n.seq_id));
+    project.seq_clips.retain(|s| s.track_id != track_id);
+    project.markers.retain(|m| m.track_id != track_id);
+    project.tracks.retain(|t| t.id != track_id);
+    if project.sampler_preview.track_id == track_id {
+        project.sampler_preview.playing = false;
+        project.sampler_preview.end_secs = None;
+    }
+    true
+}
+
 pub fn add_track(project: &mut Project) -> TrackId {
     let id = project.alloc_track_id();
     let n = project.tracks.len() + 1;
@@ -1182,5 +1218,35 @@ mod tests {
         assert!(set_tempo(&mut p, 12.0));
         assert!((p.tempo_bpm - 20.0).abs() < 1e-4);
         assert!(!set_tempo(&mut p, f32::NAN));
+    }
+
+    #[test]
+    fn rename_track_trims_and_rejects_empty() {
+        let mut p = Project::empty();
+        let id = add_track(&mut p);
+        assert!(rename_track(&mut p, id, "  Кик  "));
+        assert_eq!(p.tracks[0].name, "Кик");
+        assert!(!rename_track(&mut p, id, "Кик"));
+        assert!(!rename_track(&mut p, id, "   "));
+        assert_eq!(p.tracks[0].name, "Кик");
+    }
+
+    #[test]
+    fn delete_track_drops_clips_notes_and_markers() {
+        let mut p = Project::empty();
+        let a = add_track(&mut p);
+        let b = add_track(&mut p);
+        assert_eq!(try_place_marker(&mut p, 1.0, a), Some(1));
+        set_track_sample(&mut p, a, dummy_sample(), "a".into());
+        assert!(bind_pad_marker(&mut p, a, 0, 0, 64, 8));
+        let seq = seq_clip_on_track(&p, a).unwrap();
+        assert!(place_pad_note(&mut p, seq, 0, 0.0).is_some());
+        assert!(delete_track(&mut p, a));
+        assert_eq!(p.tracks.len(), 1);
+        assert_eq!(p.tracks[0].id, b);
+        assert!(p.seq_clips.iter().all(|s| s.track_id == b));
+        assert!(p.markers.iter().all(|m| m.track_id == b));
+        assert!(p.notes.is_empty());
+        assert!(!delete_track(&mut p, a));
     }
 }

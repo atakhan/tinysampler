@@ -1,4 +1,4 @@
-use egui::{Color32, CursorIcon, Pos2, Rect, Stroke, Vec2};
+use egui::{Color32, CursorIcon, Key, Pos2, Rect, Stroke, Vec2};
 
 use crate::app::{AppScreen, SeqDrag, TinySamplerApp};
 use crate::model::TrackId;
@@ -35,6 +35,18 @@ impl TinySamplerApp {
                             self.go_home();
                         }
                         ui.add_space(16.0);
+                        if timeline::round_transport_btn(
+                            ui,
+                            "⏮",
+                            "К началу (Home)",
+                            theme::color_transport_to_start(),
+                            btn,
+                        )
+                        .clicked()
+                        {
+                            self.transport_to_start();
+                        }
+                        ui.add_space(8.0);
                         let playing = self.current_project().transport.is_playing;
                         if playing {
                             if timeline::round_transport_btn(
@@ -174,9 +186,28 @@ impl TinySamplerApp {
                             *id,
                             name,
                             self.selected_track == Some(*id),
+                            &mut self.track_rename,
+                            &mut self.track_rename_focus,
                         ) {
                             TrackSidebarAction::Select(id) => self.selected_track = Some(id),
-                            TrackSidebarAction::Sampler(id) => self.open_sampler(id),
+                            TrackSidebarAction::Sampler(id) => {
+                                self.track_rename = None;
+                                self.track_rename_focus = false;
+                                self.open_sampler(id);
+                            }
+                            TrackSidebarAction::StartRename(id) => {
+                                self.selected_track = Some(id);
+                                self.track_rename = Some((id, name.clone()));
+                                self.track_rename_focus = true;
+                            }
+                            TrackSidebarAction::CommitRename(id, new_name) => {
+                                self.rename_studio_track(id, new_name);
+                            }
+                            TrackSidebarAction::CancelRename => {
+                                self.track_rename = None;
+                                self.track_rename_focus = false;
+                            }
+                            TrackSidebarAction::Delete(id) => self.delete_studio_track(id),
                             TrackSidebarAction::None => {}
                         }
                     }
@@ -293,7 +324,7 @@ impl TinySamplerApp {
                     area: tracks_rect,
                     n_lanes,
                     gutter_w,
-                    marker_h: theme::MARKER_LANE_HEIGHT,
+                    marker_h: 0.0,
                 };
                 let view_left = layout.content_left();
 
@@ -666,19 +697,6 @@ impl TinySamplerApp {
                             Stroke::new(1.5_f32, theme::color_track_gutter_selected()),
                         );
                     }
-                    if let Some(track_id) = lane_id {
-                        timeline::paint_marker_lane(
-                            &painter,
-                            &proj.markers,
-                            layout.marker_bar(lane),
-                            track_id,
-                            view_left,
-                            pps,
-                            scroll,
-                            self.selected_marker,
-                            lane_id == self.selected_track,
-                        );
-                    }
                 }
                 painter.rect_stroke(
                     tracks_rect,
@@ -729,21 +747,6 @@ impl TinySamplerApp {
                 }
 
                 timeline::paint_markers(&painter, &proj, &layout, view_left, pps, scroll);
-                for lane in 0..n_lanes {
-                    if let Some(track_id) = proj.track_id_at_lane(lane) {
-                        timeline::paint_marker_lane(
-                            &painter,
-                            &proj.markers,
-                            layout.marker_bar(lane),
-                            track_id,
-                            view_left,
-                            pps,
-                            scroll,
-                            self.selected_marker,
-                            Some(track_id) == self.selected_track,
-                        );
-                    }
-                }
 
                 if show_base {
                     paint_studio_base_cursor(
@@ -910,8 +913,8 @@ fn list_child_dirs(dir: &std::path::Path) -> Vec<(String, std::path::PathBuf)> {
 /// `available_height` is the panel's inner height, including the ruler row.
 fn studio_lane_block_height(available_height: f32, n_lanes: usize) -> f32 {
     let avail_for_lanes = (available_height - theme::TIME_RULER_HEIGHT).max(80.0);
-    let min_h = theme::MARKER_LANE_HEIGHT + 72.0;
-    let max_h = theme::TIMELINE_TRACK_HEIGHT + theme::MARKER_LANE_HEIGHT;
+    let min_h = 72.0;
+    let max_h = theme::TIMELINE_TRACK_HEIGHT;
     (avail_for_lanes / n_lanes.max(1) as f32).clamp(min_h, max_h)
 }
 
@@ -919,6 +922,10 @@ enum TrackSidebarAction {
     None,
     Select(TrackId),
     Sampler(TrackId),
+    StartRename(TrackId),
+    CommitRename(TrackId, String),
+    CancelRename,
+    Delete(TrackId),
 }
 
 /// Header strip the same height as the time ruler. Returns true when "+" was clicked.
@@ -966,7 +973,7 @@ fn show_track_sidebar_header(ui: &mut egui::Ui) -> bool {
     add_clicked
 }
 
-/// One sidebar row, exactly `block_h` tall, with the same marker strip as the lane.
+/// One sidebar row, exactly `block_h` tall — flush with the neighbouring lanes.
 fn show_track_sidebar_row(
     ui: &mut egui::Ui,
     block_h: f32,
@@ -974,27 +981,17 @@ fn show_track_sidebar_row(
     id: TrackId,
     name: &str,
     selected: bool,
+    rename: &mut Option<(TrackId, String)>,
+    rename_focus: &mut bool,
 ) -> TrackSidebarAction {
     let width = ui.available_width();
     let (row, _) = ui.allocate_exact_size(Vec2::new(width, block_h), egui::Sense::hover());
-    let marker_h = theme::MARKER_LANE_HEIGHT.min(row.height());
-    let marker = Rect::from_min_size(row.min, Vec2::new(row.width(), marker_h));
-    let clips = Rect::from_min_max(Pos2::new(row.left(), marker.bottom()), row.max);
     let bg = if lane % 2 == 0 {
         theme::color_timeline_bg()
     } else {
         theme::color_timeline_bg_alt()
     };
-    ui.painter().rect_filled(clips, 0.0, bg);
-    ui.painter()
-        .rect_filled(marker, 0.0, theme::color_marker_lane_bg());
-    ui.painter().line_segment(
-        [
-            Pos2::new(marker.left(), marker.bottom()),
-            Pos2::new(marker.right(), marker.bottom()),
-        ],
-        Stroke::new(1.0_f32, theme::color_ruler_bottom_line()),
-    );
+    ui.painter().rect_filled(row, 0.0, bg);
     if selected {
         ui.painter().rect_stroke(
             row,
@@ -1008,44 +1005,82 @@ fn show_track_sidebar_row(
         ui.id().with(("studio_track_row", id)),
         egui::Sense::click(),
     );
-    if click.hovered() {
-        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-    }
-    let mut action = if click.clicked() {
-        TrackSidebarAction::Select(id)
-    } else {
-        TrackSidebarAction::None
-    };
+    let mut action = merge_track_menu(&click, id, TrackSidebarAction::None);
 
     let controls = Rect::from_min_size(
-        Pos2::new(row.left() + 8.0, marker.bottom() + 6.0),
+        Pos2::new(row.left() + 8.0, row.top() + 6.0),
         Vec2::new((row.width() - 16.0).max(0.0), 24.0),
     );
+    let renaming = rename.as_ref().is_some_and(|(tid, _)| *tid == id);
     let mut controls_ui = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(controls)
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
-    let button_w = 72.0;
-    let name_w = (controls_ui.available_width() - button_w).max(16.0);
-    let name_color = if selected {
-        Color32::WHITE
+    let name_w = controls_ui.available_width().max(16.0);
+    if renaming {
+        if let Some((_, buf)) = rename.as_mut() {
+            let resp = controls_ui.add(
+                egui::TextEdit::singleline(buf)
+                    .desired_width(name_w)
+                    .font(egui::FontId::proportional(14.0))
+                    .id(controls_ui.id().with(("studio_track_rename", id))),
+            );
+            if *rename_focus {
+                resp.request_focus();
+                *rename_focus = false;
+            }
+            let escape = controls_ui.input(|i| i.key_pressed(Key::Escape));
+            if escape {
+                action = TrackSidebarAction::CancelRename;
+            } else if resp.lost_focus() {
+                let committed = buf.clone();
+                action = TrackSidebarAction::CommitRename(id, committed);
+            }
+        }
     } else {
-        Color32::from_gray(220)
-    };
-    controls_ui.add_sized(
-        Vec2::new(name_w, 22.0),
-        egui::Label::new(egui::RichText::new(name).size(14.0).color(name_color))
-            .selectable(false)
-            .truncate(),
-    );
-    if controls_ui
-        .small_button("сэмпл")
-        .on_hover_text("Инструмент сэмплинга")
-        .clicked()
-    {
-        action = TrackSidebarAction::Sampler(id);
+        let name_color = if selected {
+            Color32::WHITE
+        } else {
+            Color32::from_gray(220)
+        };
+        let name_resp = controls_ui.add_sized(
+            Vec2::new(name_w, 22.0),
+            egui::Label::new(egui::RichText::new(name).size(14.0).color(name_color))
+                .selectable(false)
+                .truncate()
+                .sense(egui::Sense::click()),
+        );
+        if name_resp.hovered() {
+            controls_ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        }
+        if name_resp.clicked() {
+            action = TrackSidebarAction::Sampler(id);
+        }
+        action = merge_track_menu(&name_resp, id, action);
+        if click.clicked() && !name_resp.clicked() {
+            action = TrackSidebarAction::Select(id);
+        }
     }
+    action
+}
+
+fn merge_track_menu(
+    resp: &egui::Response,
+    id: TrackId,
+    current: TrackSidebarAction,
+) -> TrackSidebarAction {
+    let mut action = current;
+    resp.context_menu(|ui| {
+        if ui.button("Переименовать").clicked() {
+            action = TrackSidebarAction::StartRename(id);
+            ui.close_menu();
+        }
+        if ui.button("Удалить").clicked() {
+            action = TrackSidebarAction::Delete(id);
+            ui.close_menu();
+        }
+    });
     action
 }
 

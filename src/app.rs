@@ -72,6 +72,8 @@ pub struct TinySamplerApp {
     pub(crate) selected_marker: Option<(u8, TrackId)>,
     pub(crate) marker_drag: Option<(u8, TrackId)>,
     pub(crate) selected_track: Option<TrackId>,
+    pub(crate) track_rename: Option<(TrackId, String)>,
+    pub(crate) track_rename_focus: bool,
     pub(crate) screen: AppScreen,
     pub(crate) persist: PersistSession,
     pub(crate) sound_library_dir: Option<PathBuf>,
@@ -149,6 +151,8 @@ impl TinySamplerApp {
             selected_marker: None,
             marker_drag: None,
             selected_track: None,
+            track_rename: None,
+            track_rename_focus: false,
             screen: AppScreen::Library,
             persist,
             sound_library_dir: settings.sound_library_dir,
@@ -263,6 +267,18 @@ impl TinySamplerApp {
         } else {
             0.0
         }
+    }
+
+    /// Jump the playlist to t = 0. Playback state is unchanged.
+    pub(crate) fn transport_to_start(&mut self) {
+        let playing = self.current_project().transport.is_playing;
+        let paused = self.studio_transport_paused;
+        self.seek_studio(0.0);
+        self.timeline_scroll_px = 0.0;
+        if !playing && !paused {
+            self.studio_base_scroll_px = 0.0;
+        }
+        self.follow_playhead_suspended = false;
     }
 
     /// Move the studio playhead. While fully stopped, this also moves the return cursor.
@@ -523,13 +539,14 @@ impl TinySamplerApp {
             return;
         }
         if self.seq_editor.is_some() {
-            let (escape, delete, space, ctrl_space, save) = ctx.input(|i| {
+            let (escape, delete, space, ctrl_space, home, save) = ctx.input(|i| {
                 let mods = i.modifiers.ctrl || i.modifiers.command || i.modifiers.alt;
                 (
                     i.key_pressed(Key::Escape),
                     i.key_pressed(Key::Delete) && !mods,
                     i.key_pressed(Key::Space) && !i.modifiers.ctrl,
                     i.key_pressed(Key::Space) && i.modifiers.ctrl,
+                    i.key_pressed(Key::Home) && !mods,
                     i.key_pressed(Key::S) && (i.modifiers.ctrl || i.modifiers.command),
                 )
             });
@@ -541,12 +558,14 @@ impl TinySamplerApp {
                 self.transport_pause();
             } else if space {
                 self.transport_on_space();
+            } else if home {
+                self.transport_to_start();
             } else if save {
                 self.persist_now(true);
             }
             return;
         }
-        let (ctrl_space, space, open_wav, delete_clip, place_marker, play_marker_slot, save) =
+        let (ctrl_space, space, home, open_wav, delete_clip, place_marker, play_marker_slot, save) =
             ctx.input(|i| {
                 let mods = i.modifiers.ctrl || i.modifiers.command || i.modifiers.alt;
                 let space = i.key_pressed(Key::Space);
@@ -562,6 +581,7 @@ impl TinySamplerApp {
                 (
                     space && i.modifiers.ctrl,
                     space && !i.modifiers.ctrl,
+                    i.key_pressed(Key::Home) && !mods,
                     open_wav,
                     delete_clip,
                     place_marker,
@@ -573,6 +593,8 @@ impl TinySamplerApp {
             self.transport_pause();
         } else if space {
             self.transport_on_space();
+        } else if home {
+            self.transport_to_start();
         } else if open_wav {
             self.open_load_browser(false);
         } else if save {
@@ -743,6 +765,51 @@ impl TinySamplerApp {
             }
             Err(e) => self.status = format!("Не удалось открыть: {e}"),
         }
+    }
+
+    pub(crate) fn rename_studio_track(&mut self, id: TrackId, name: String) {
+        self.track_rename = None;
+        self.track_rename_focus = false;
+        let mut p = (*self.current_project()).clone();
+        if project_actions::rename_track(&mut p, id, &name) {
+            self.publish(p);
+        }
+    }
+
+    pub(crate) fn delete_studio_track(&mut self, id: TrackId) {
+        if self.track_rename.as_ref().is_some_and(|(tid, _)| *tid == id) {
+            self.track_rename = None;
+            self.track_rename_focus = false;
+        }
+        if self.sampler_track == Some(id) {
+            self.close_sampler();
+        }
+        if let Some(seq_id) = self.seq_editor {
+            let belongs = self
+                .current_project()
+                .seq_clips
+                .iter()
+                .any(|s| s.id == seq_id && s.track_id == id);
+            if belongs {
+                self.close_seq_editor();
+            }
+        }
+        let mut p = (*self.current_project()).clone();
+        if !project_actions::delete_track(&mut p, id) {
+            return;
+        }
+        if self.selected_seq.is_some_and(|sid| !p.seq_clips.iter().any(|s| s.id == sid)) {
+            self.selected_seq = None;
+            self.seq_drag = None;
+        }
+        if self.selected_marker.map(|(_, tid)| tid) == Some(id) {
+            self.selected_marker = None;
+            self.marker_drag = None;
+        }
+        if self.selected_track == Some(id) {
+            self.selected_track = p.tracks.first().map(|t| t.id);
+        }
+        self.publish(p);
     }
 
     pub(crate) fn add_studio_track(&mut self) {

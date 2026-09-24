@@ -16,9 +16,6 @@ pub const TIME_RULER_HEIGHT: f32 = 30.0;
 /// Tempo / ruler-mode strip above the time ruler.
 pub const TEMPO_BAR_HEIGHT: f32 = 36.0;
 
-/// Cue strip above each track's clips.
-pub const MARKER_LANE_HEIGHT: f32 = 26.0;
-
 /// Left track-select column.
 pub const TRACK_GUTTER_WIDTH: f32 = 40.0;
 
@@ -51,6 +48,10 @@ pub const SAMPLER_PAD_COLS: usize = 8;
 
 pub fn color_transport_load() -> Color32 {
     Color32::from_rgb(64, 108, 168)
+}
+
+pub fn color_transport_to_start() -> Color32 {
+    Color32::from_rgb(72, 92, 128)
 }
 
 pub fn color_transport_play() -> Color32 {
