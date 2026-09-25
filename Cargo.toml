@@ -1,6 +1,6 @@
 [package]
 name = "tinysampler"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "Minimal sampler prototype: WAV/MP3, timeline, cpal callback, egui"
 
