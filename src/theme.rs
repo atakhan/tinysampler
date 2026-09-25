@@ -35,10 +35,12 @@ pub const PIANO_KEY_COUNT: usize = 16;
 pub const PIANO_KEY_W: f32 = 32.0;
 pub const PIANO_KEY_MIN_H: f32 = 14.0;
 pub const TIMELINE_TRACK_HEIGHT: f32 = 160.0;
+/// Alt+wheel over the studio sidebar. Auto-fit still caps at [`TIMELINE_TRACK_HEIGHT`].
+pub const STUDIO_LANE_H_MIN: f32 = 72.0;
+pub const STUDIO_LANE_H_MAX: f32 = 280.0;
 
 pub const STUDIO_TOP_BAR_H: f32 = 52.0;
 pub const STUDIO_SIDEBAR_W: f32 = 200.0;
-pub const STUDIO_TRANSPORT_BTN: f32 = 36.0;
 pub const SAMPLER_MAP_H: f32 = 60.0;
 pub const SAMPLER_WAVE_H: f32 = 320.0;
 pub const SAMPLER_PAD_H: f32 = 48.0;
@@ -50,20 +52,24 @@ pub fn color_transport_load() -> Color32 {
     Color32::from_rgb(64, 108, 168)
 }
 
-pub fn color_transport_to_start() -> Color32 {
-    Color32::from_rgb(72, 92, 128)
+pub fn color_transport_bar() -> Color32 {
+    Color32::from_rgb(52, 52, 62)
 }
 
 pub fn color_transport_play() -> Color32 {
     Color32::from_rgb(52, 140, 92)
 }
 
-pub fn color_transport_pause() -> Color32 {
-    Color32::from_rgb(118, 98, 52)
-}
-
 pub fn color_transport_stop() -> Color32 {
     Color32::from_rgb(138, 56, 56)
+}
+
+pub fn color_track_mute() -> Color32 {
+    Color32::from_rgb(168, 72, 56)
+}
+
+pub fn color_track_solo() -> Color32 {
+    Color32::from_rgb(168, 132, 48)
 }
 
 pub fn color_timeline_bg() -> Color32 {

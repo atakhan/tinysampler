@@ -9,7 +9,6 @@ use crate::timeline;
 
 impl TinySamplerApp {
     pub(crate) fn show_studio(&mut self, ctx: &egui::Context) {
-        let btn = theme::STUDIO_TRANSPORT_BTN;
         let studio_locked = self.sampler_track.is_some() || self.seq_editor.is_some();
         if studio_locked {
             self.marker_drag = None;
@@ -35,54 +34,47 @@ impl TinySamplerApp {
                             self.go_home();
                         }
                         ui.add_space(16.0);
-                        if timeline::round_transport_btn(
+                        let playing = self.current_project().transport.is_playing;
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        let cell = Vec2::new(40.0, 32.0);
+                        if timeline::fused_transport_btn(
                             ui,
                             "⏮",
                             "К началу (Home)",
-                            theme::color_transport_to_start(),
-                            btn,
+                            timeline::TransportEdge::Left,
+                            cell,
                         )
                         .clicked()
                         {
                             self.transport_to_start();
                         }
-                        ui.add_space(8.0);
-                        let playing = self.current_project().transport.is_playing;
-                        if playing {
-                            if timeline::round_transport_btn(
-                                ui,
-                                "⏸",
-                                "Pause (Ctrl+Space)",
-                                theme::color_transport_pause(),
-                                btn,
-                            )
-                            .clicked()
-                            {
-                                self.transport_toggle_play_pause();
-                            }
-                        } else if timeline::round_transport_btn(
+                        if timeline::fused_transport_btn(
                             ui,
-                            "▶",
-                            "Play (Space)",
-                            theme::color_transport_play(),
-                            btn,
+                            if playing { "⏸" } else { "▶" },
+                            if playing {
+                                "Pause (Ctrl+Space)"
+                            } else {
+                                "Play (Space)"
+                            },
+                            timeline::TransportEdge::Mid,
+                            cell,
                         )
                         .clicked()
                         {
                             self.transport_toggle_play_pause();
                         }
-                        ui.add_space(8.0);
-                        if timeline::round_transport_btn(
+                        if timeline::fused_transport_btn(
                             ui,
                             "⏹",
                             "Stop (Space)",
-                            theme::color_transport_stop(),
-                            btn,
+                            timeline::TransportEdge::Right,
+                            cell,
                         )
                         .clicked()
                         {
                             self.transport_stop();
                         }
+                        ui.spacing_mut().item_spacing.x = 8.0;
                         ui.add_space(16.0);
                         let clock = timeline::format_clock(self.playhead_secs());
                         ui.add(
@@ -143,8 +135,11 @@ impl TinySamplerApp {
             .show(ctx, |ui| {
                 ui.add_enabled_ui(!studio_locked, |ui| {
                     let proj = self.current_project();
-                    let names: Vec<(TrackId, String)> =
-                        proj.tracks.iter().map(|t| (t.id, t.name.clone())).collect();
+                    let names: Vec<(TrackId, String, bool, bool)> = proj
+                        .tracks
+                        .iter()
+                        .map(|t| (t.id, t.name.clone(), t.muted, t.solo))
+                        .collect();
                     drop(proj);
                     if names.is_empty() {
                         ui.add_space(8.0);
@@ -174,11 +169,30 @@ impl TinySamplerApp {
                     // Flush with the ruler: default item spacing would open a gap
                     // the lanes do not have.
                     ui.spacing_mut().item_spacing.y = 0.0;
-                    let block_h = studio_lane_block_height(ui.available_height(), names.len());
+                    let avail_h = ui.available_height();
+                    if let Some(hp) = ctx.pointer_hover_pos() {
+                        if ui.max_rect().contains(hp) {
+                            let preferred = self.current_project().studio_lane_h;
+                            if let Some(next) =
+                                next_studio_lane_height(ctx, preferred, avail_h, names.len())
+                            {
+                                let mut p = (*self.current_project()).clone();
+                                if (p.studio_lane_h - next).abs() > 1e-3 {
+                                    p.studio_lane_h = next;
+                                    self.publish(p);
+                                }
+                            }
+                        }
+                    }
+                    let block_h = studio_lane_block_height(
+                        avail_h,
+                        names.len(),
+                        self.current_project().studio_lane_h,
+                    );
                     if show_track_sidebar_header(ui) {
                         self.add_studio_track();
                     }
-                    for (lane, (id, name)) in names.iter().enumerate() {
+                    for (lane, (id, name, muted, solo)) in names.iter().enumerate() {
                         match show_track_sidebar_row(
                             ui,
                             block_h,
@@ -186,6 +200,8 @@ impl TinySamplerApp {
                             *id,
                             name,
                             self.selected_track == Some(*id),
+                            *muted,
+                            *solo,
                             &mut self.track_rename,
                             &mut self.track_rename_focus,
                         ) {
@@ -208,6 +224,8 @@ impl TinySamplerApp {
                                 self.track_rename_focus = false;
                             }
                             TrackSidebarAction::Delete(id) => self.delete_studio_track(id),
+                            TrackSidebarAction::ToggleMute(id) => self.toggle_studio_mute(id),
+                            TrackSidebarAction::ToggleSolo(id) => self.toggle_studio_solo(id),
                             TrackSidebarAction::None => {}
                         }
                     }
@@ -238,7 +256,11 @@ impl TinySamplerApp {
                 let gutter_w = 0.0_f32;
                 // Match the sidebar: no gap between the ruler and the first lane.
                 ui.spacing_mut().item_spacing.y = 0.0;
-                let block_h = studio_lane_block_height(ui.available_height(), n_lanes);
+                let block_h = studio_lane_block_height(
+                    ui.available_height(),
+                    n_lanes,
+                    proj.studio_lane_h,
+                );
                 let timeline_height = block_h * n_lanes as f32;
                 let marker_end = proj
                     .markers
@@ -911,11 +933,37 @@ fn list_child_dirs(dir: &std::path::Path) -> Vec<(String, std::path::PathBuf)> {
 
 /// Lane height shared by the timeline and the track sidebar.
 /// `available_height` is the panel's inner height, including the ruler row.
-fn studio_lane_block_height(available_height: f32, n_lanes: usize) -> f32 {
+/// `preferred` is `0` for auto-fit, otherwise the last Alt+wheel height.
+fn studio_lane_block_height(available_height: f32, n_lanes: usize, preferred: f32) -> f32 {
     let avail_for_lanes = (available_height - theme::TIME_RULER_HEIGHT).max(80.0);
-    let min_h = 72.0;
-    let max_h = theme::TIMELINE_TRACK_HEIGHT;
-    (avail_for_lanes / n_lanes.max(1) as f32).clamp(min_h, max_h)
+    let min_h = theme::STUDIO_LANE_H_MIN;
+    let fit_max = (avail_for_lanes / n_lanes.max(1) as f32).max(min_h);
+    let max_h = theme::STUDIO_LANE_H_MAX.min(fit_max);
+    if preferred > 0.0 {
+        preferred.clamp(min_h, max_h)
+    } else {
+        (avail_for_lanes / n_lanes.max(1) as f32).clamp(min_h, theme::TIMELINE_TRACK_HEIGHT.min(max_h))
+    }
+}
+
+fn next_studio_lane_height(
+    ctx: &egui::Context,
+    preferred: f32,
+    available_height: f32,
+    n_lanes: usize,
+) -> Option<f32> {
+    let (alt, ctrl, dy) = ctx.input(|i| {
+        (
+            i.modifiers.alt,
+            i.modifiers.ctrl || i.modifiers.command,
+            i.smooth_scroll_delta.y + i.raw_scroll_delta.y,
+        )
+    });
+    if !alt || ctrl || dy.abs() <= 0.01 {
+        return None;
+    }
+    let cur = studio_lane_block_height(available_height, n_lanes, preferred);
+    Some((cur * (1.0 + dy * 0.004)).clamp(theme::STUDIO_LANE_H_MIN, theme::STUDIO_LANE_H_MAX))
 }
 
 enum TrackSidebarAction {
@@ -926,6 +974,8 @@ enum TrackSidebarAction {
     CommitRename(TrackId, String),
     CancelRename,
     Delete(TrackId),
+    ToggleMute(TrackId),
+    ToggleSolo(TrackId),
 }
 
 /// Header strip the same height as the time ruler. Returns true when "+" was clicked.
@@ -981,6 +1031,8 @@ fn show_track_sidebar_row(
     id: TrackId,
     name: &str,
     selected: bool,
+    muted: bool,
+    solo: bool,
     rename: &mut Option<(TrackId, String)>,
     rename_focus: &mut bool,
 ) -> TrackSidebarAction {
@@ -1017,7 +1069,10 @@ fn show_track_sidebar_row(
             .max_rect(controls)
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
-    let name_w = controls_ui.available_width().max(16.0);
+    let btn = 22.0;
+    let ms_w = btn * 2.0 + 4.0;
+    let name_w = (controls_ui.available_width() - ms_w - 4.0).max(16.0);
+    let mut used_name = false;
     if renaming {
         if let Some((_, buf)) = rename.as_mut() {
             let resp = controls_ui.add(
@@ -1037,9 +1092,12 @@ fn show_track_sidebar_row(
                 let committed = buf.clone();
                 action = TrackSidebarAction::CommitRename(id, committed);
             }
+            used_name = resp.hovered() || resp.has_focus() || resp.lost_focus();
         }
     } else {
-        let name_color = if selected {
+        let name_color = if muted {
+            Color32::from_gray(140)
+        } else if selected {
             Color32::WHITE
         } else {
             Color32::from_gray(220)
@@ -1058,11 +1116,59 @@ fn show_track_sidebar_row(
             action = TrackSidebarAction::Sampler(id);
         }
         action = merge_track_menu(&name_resp, id, action);
-        if click.clicked() && !name_resp.clicked() {
-            action = TrackSidebarAction::Select(id);
-        }
+        used_name = name_resp.clicked() || name_resp.hovered();
+    }
+    controls_ui.add_space(4.0);
+    let mute_resp = track_ms_btn(
+        &mut controls_ui,
+        "M",
+        muted,
+        theme::color_track_mute(),
+        "Mute",
+        btn,
+    );
+    let solo_resp = track_ms_btn(
+        &mut controls_ui,
+        "S",
+        solo,
+        theme::color_track_solo(),
+        "Solo",
+        btn,
+    );
+    if mute_resp.clicked() {
+        action = TrackSidebarAction::ToggleMute(id);
+    } else if solo_resp.clicked() {
+        action = TrackSidebarAction::ToggleSolo(id);
+    } else if !renaming && click.clicked() && !used_name {
+        action = TrackSidebarAction::Select(id);
     }
     action
+}
+
+fn track_ms_btn(
+    ui: &mut egui::Ui,
+    label: &str,
+    active: bool,
+    fill: Color32,
+    tooltip: &str,
+    size: f32,
+) -> egui::Response {
+    let bg = if active {
+        fill
+    } else {
+        Color32::from_gray(48)
+    };
+    let fg = if active {
+        Color32::WHITE
+    } else {
+        Color32::from_gray(180)
+    };
+    ui.add(
+        egui::Button::new(egui::RichText::new(label).size(13.0).color(fg).strong())
+            .min_size(Vec2::splat(size))
+            .fill(bg),
+    )
+    .on_hover_text(tooltip)
 }
 
 fn merge_track_menu(
@@ -1109,4 +1215,27 @@ fn paint_studio_base_cursor(painter: &egui::Painter, rect: Rect, x: f32, ruler: 
 
 fn snap_studio_time(t: f32, step: f32) -> f32 {
     crate::time::snap_time_round(t.max(0.0), step)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::studio_lane_block_height;
+    use crate::theme;
+
+    #[test]
+    fn auto_lane_height_fills_then_clamps() {
+        let h = studio_lane_block_height(theme::TIME_RULER_HEIGHT + 400.0, 2, 0.0);
+        assert!((h - theme::TIMELINE_TRACK_HEIGHT).abs() < 1e-3);
+        let tight = studio_lane_block_height(theme::TIME_RULER_HEIGHT + 80.0, 8, 0.0);
+        assert!((tight - theme::STUDIO_LANE_H_MIN).abs() < 1e-3);
+    }
+
+    #[test]
+    fn preferred_lane_height_is_clamped_to_the_window() {
+        let preferred = 200.0;
+        let h = studio_lane_block_height(theme::TIME_RULER_HEIGHT + 160.0, 2, preferred);
+        assert!((h - 80.0).abs() < 1e-3);
+        let roomy = studio_lane_block_height(theme::TIME_RULER_HEIGHT + 800.0, 2, preferred);
+        assert!((roomy - preferred).abs() < 1e-3);
+    }
 }

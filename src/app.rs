@@ -812,6 +812,20 @@ impl TinySamplerApp {
         self.publish(p);
     }
 
+    pub(crate) fn toggle_studio_mute(&mut self, id: TrackId) {
+        let mut p = (*self.current_project()).clone();
+        if project_actions::toggle_track_mute(&mut p, id) {
+            self.publish(p);
+        }
+    }
+
+    pub(crate) fn toggle_studio_solo(&mut self, id: TrackId) {
+        let mut p = (*self.current_project()).clone();
+        if project_actions::toggle_track_solo(&mut p, id) {
+            self.publish(p);
+        }
+    }
+
     pub(crate) fn add_studio_track(&mut self) {
         let mut p = (*self.current_project()).clone();
         let id = project_actions::add_track(&mut p);

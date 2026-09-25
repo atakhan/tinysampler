@@ -101,6 +101,8 @@ pub struct Track {
     pub sample_slices: Vec<SampleSlice>,
     /// Sample chops in the instrument; slot `0` is top-left pad (Q).
     pub pad_markers: Vec<PadMarker>,
+    pub muted: bool,
+    pub solo: bool,
 }
 
 impl Track {
@@ -199,6 +201,8 @@ pub struct Project {
     pub next_track_id: u64,
     /// Project tempo (BPM). Sole source of truth for the 4/4 grid and default chop length.
     pub tempo_bpm: f32,
+    /// Shared studio lane height in pixels. `0` means auto-fit the window.
+    pub studio_lane_h: f32,
     /// Preview inside the sampling instrument (takes over the output while playing).
     pub sampler_preview: SamplerPreview,
     /// File audition for the load window. Not written to disk.
@@ -218,6 +222,7 @@ impl Project {
             next_seq_id: 1,
             next_track_id: 1,
             tempo_bpm: 120.0,
+            studio_lane_h: 0.0,
             sampler_preview: SamplerPreview::default(),
             audition: FileAudition::default(),
         }
@@ -280,6 +285,20 @@ impl Project {
 
     pub fn track_speed(&self, id: TrackId) -> f32 {
         self.track(id).map(Track::playback_speed).unwrap_or(1.0)
+    }
+
+    /// Studio mix: mute always wins; if any track is soloed, only solos play.
+    pub fn track_audible(&self, id: TrackId) -> bool {
+        let Some(track) = self.track(id) else {
+            return false;
+        };
+        if track.muted {
+            return false;
+        }
+        if self.tracks.iter().any(|t| t.solo) {
+            return track.solo;
+        }
+        true
     }
 
     pub fn sample_len(&self, id: TrackId) -> usize {

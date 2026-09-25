@@ -10,6 +10,9 @@ pub fn mix_mono_sample_at(project: &Project, t: f32) -> f32 {
         if t < seq.start_time_secs || t >= seq.end_time_secs() {
             continue;
         }
+        if !project.track_audible(seq.track_id) {
+            continue;
+        }
         let local = t - seq.start_time_secs;
         let Some(track) = project.track(seq.track_id) else {
             continue;
@@ -126,5 +129,64 @@ mod tests {
         assert!(project_actions::place_pad_note(&mut p, seq, 0, 0.0).is_some());
         let v = mix_mono_sample_at(&p, 0.5);
         assert!(v > 0.5, "{v}");
+    }
+
+    fn track_with_note() -> (crate::model::Project, crate::model::TrackId) {
+        let mut p = crate::model::Project::empty();
+        let id = project_actions::add_track(&mut p);
+        let data = vec![0.5f32; 64];
+        let peaks = PeakPyramid::build(&data);
+        project_actions::set_track_sample(
+            &mut p,
+            id,
+            Sample::new_mono(Arc::new(data), Arc::new(peaks), 48_000),
+            "a".into(),
+        );
+        p.track_mut(id).unwrap().pad_markers.push(PadMarker {
+            slot: 0,
+            start_index: 0,
+            end_index: 8,
+        });
+        let seq = project_actions::seq_clip_on_track(&p, id).unwrap();
+        assert!(project_actions::place_pad_note(&mut p, seq, 0, 0.0).is_some());
+        (p, id)
+    }
+
+    #[test]
+    fn mute_silences_a_track() {
+        let (mut p, id) = track_with_note();
+        assert!(mix_mono_sample_at(&p, 0.0) > 0.4);
+        assert!(project_actions::toggle_track_mute(&mut p, id));
+        assert_eq!(mix_mono_sample_at(&p, 0.0), 0.0);
+        assert!(!p.track_audible(id));
+    }
+
+    #[test]
+    fn solo_plays_only_soloed_tracks() {
+        let (mut p, a) = track_with_note();
+        let b = project_actions::add_track(&mut p);
+        let data = vec![0.5f32; 64];
+        let peaks = PeakPyramid::build(&data);
+        project_actions::set_track_sample(
+            &mut p,
+            b,
+            Sample::new_mono(Arc::new(data), Arc::new(peaks), 48_000),
+            "b".into(),
+        );
+        p.track_mut(b).unwrap().pad_markers.push(PadMarker {
+            slot: 0,
+            start_index: 0,
+            end_index: 8,
+        });
+        let seq = project_actions::seq_clip_on_track(&p, b).unwrap();
+        assert!(project_actions::place_pad_note(&mut p, seq, 0, 0.0).is_some());
+        assert!(mix_mono_sample_at(&p, 0.0) > 0.8);
+        assert!(project_actions::toggle_track_solo(&mut p, a));
+        let soloed = mix_mono_sample_at(&p, 0.0);
+        assert!(soloed > 0.4 && soloed < 0.7, "{soloed}");
+        assert!(p.track_audible(a));
+        assert!(!p.track_audible(b));
+        assert!(project_actions::toggle_track_mute(&mut p, a));
+        assert_eq!(mix_mono_sample_at(&p, 0.0), 0.0);
     }
 }

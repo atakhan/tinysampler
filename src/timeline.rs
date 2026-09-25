@@ -547,24 +547,46 @@ pub fn paint_track_gutter(
     );
 }
 
-/// Circular transport control; icon is centered.
-pub fn round_transport_btn(
+#[derive(Clone, Copy)]
+pub enum TransportEdge {
+    Left,
+    Mid,
+    Right,
+}
+
+/// One cell of the fused rectangular transport bar.
+pub fn fused_transport_btn(
     ui: &mut egui::Ui,
     icon: &str,
     tooltip: &str,
-    fill: Color32,
-    diameter: f32,
+    edge: TransportEdge,
+    size: Vec2,
 ) -> egui::Response {
-    let r = diameter * 0.5;
+    let r = 4.0_f32;
+    let rounding = match edge {
+        TransportEdge::Left => egui::Rounding {
+            nw: r,
+            ne: 0.0,
+            sw: r,
+            se: 0.0,
+        },
+        TransportEdge::Mid => egui::Rounding::ZERO,
+        TransportEdge::Right => egui::Rounding {
+            nw: 0.0,
+            ne: r,
+            sw: 0.0,
+            se: r,
+        },
+    };
     let text = RichText::new(icon)
-        .size(diameter * 0.38)
-        .color(Color32::WHITE);
+        .size((size.y * 0.48).max(12.0))
+        .color(Color32::from_gray(230));
     ui.add(
         egui::Button::new(text)
-            .min_size(Vec2::splat(diameter))
-            .fill(fill)
-            .stroke(Stroke::new(1.0, Color32::from_gray(55)))
-            .rounding(egui::Rounding::same(r)),
+            .min_size(size)
+            .fill(theme::color_transport_bar())
+            .stroke(Stroke::new(1.0_f32, Color32::from_gray(70)))
+            .rounding(rounding),
     )
     .on_hover_text(tooltip)
 }

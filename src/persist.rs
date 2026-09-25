@@ -61,6 +61,8 @@ struct ProjectFile {
     /// Legacy: PCM used to be stored at the output device rate.
     #[serde(default)]
     pcm_sample_rate: u32,
+    #[serde(default)]
+    studio_lane_h: f32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -79,6 +81,10 @@ struct TrackFile {
     sample_label: String,
     #[serde(default)]
     sample_slices: Vec<SampleSliceFile>,
+    #[serde(default)]
+    muted: bool,
+    #[serde(default)]
+    solo: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -345,6 +351,7 @@ pub fn save_project(
         id,
         name: project.name.clone(),
         tempo_bpm: project.tempo_bpm,
+        studio_lane_h: project.studio_lane_h,
         pcm_sample_rate: 0,
         next_note_id: project.next_note_id,
         next_seq_id: project.next_seq_id,
@@ -370,6 +377,8 @@ pub fn save_project(
                     .collect(),
                 sample,
                 sample_label: t.sample_label.clone(),
+                muted: t.muted,
+                solo: t.solo,
                 sample_slices: t
                     .sample_slices
                     .iter()
@@ -616,6 +625,8 @@ pub fn load_project(root: &Path, id: u64) -> Result<LoadedProject, String> {
             sample_label,
             sample_slices,
             pad_markers,
+            muted: t.muted,
+            solo: t.solo,
         });
     }
 
@@ -776,6 +787,11 @@ pub fn load_project(root: &Path, id: u64) -> Result<LoadedProject, String> {
         next_seq_id,
         next_track_id,
         tempo_bpm: file.tempo_bpm.clamp(20.0, 400.0),
+        studio_lane_h: if file.studio_lane_h.is_finite() && file.studio_lane_h > 0.0 {
+            file.studio_lane_h.clamp(crate::theme::STUDIO_LANE_H_MIN, crate::theme::STUDIO_LANE_H_MAX)
+        } else {
+            0.0
+        },
         sampler_preview: crate::model::SamplerPreview::default(),
         audition: crate::model::FileAudition::default(),
     };
@@ -899,6 +915,9 @@ mod tests {
         );
         let seq0 = project_actions::seq_clip_on_track(&project, t0).unwrap();
         assert!(project_actions::place_pad_note(&mut project, seq0, 0, 0.5).is_some());
+        assert!(project_actions::toggle_track_mute(&mut project, t0));
+        assert!(project_actions::toggle_track_solo(&mut project, t1));
+        project.studio_lane_h = 140.0;
 
         let mut files = SampleFileMap::new();
         save_project(&root, 7, &project, &mut files).unwrap();
@@ -933,6 +952,11 @@ mod tests {
         assert_eq!(loaded.tracks[0].pad_markers[0].end_index, 15);
         assert_eq!(loaded.notes.len(), 1);
         assert_eq!(loaded.seq_clips.len(), 2);
+        assert!(loaded.tracks[0].muted);
+        assert!(!loaded.tracks[0].solo);
+        assert!(!loaded.tracks[1].muted);
+        assert!(loaded.tracks[1].solo);
+        assert!((loaded.studio_lane_h - 140.0).abs() < 1e-3);
 
         let _ = fs::remove_dir_all(&root);
     }

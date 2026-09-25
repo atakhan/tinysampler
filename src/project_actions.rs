@@ -57,6 +57,8 @@ pub fn add_track(project: &mut Project) -> TrackId {
         sample_label: String::new(),
         sample_slices: Vec::new(),
         pad_markers: Vec::new(),
+        muted: false,
+        solo: false,
     });
     let duration = default_seq_duration_secs(project.tempo_bpm);
     let seq_id = project.alloc_seq_id();
@@ -67,6 +69,22 @@ pub fn add_track(project: &mut Project) -> TrackId {
         duration_secs: duration,
     });
     id
+}
+
+pub fn toggle_track_mute(project: &mut Project, track_id: TrackId) -> bool {
+    let Some(track) = project.track_mut(track_id) else {
+        return false;
+    };
+    track.muted = !track.muted;
+    true
+}
+
+pub fn toggle_track_solo(project: &mut Project, track_id: TrackId) -> bool {
+    let Some(track) = project.track_mut(track_id) else {
+        return false;
+    };
+    track.solo = !track.solo;
+    true
 }
 
 pub fn set_track_sample(project: &mut Project, track_id: TrackId, sample: Sample, label: String) {
@@ -1248,5 +1266,19 @@ mod tests {
         assert!(p.markers.iter().all(|m| m.track_id == b));
         assert!(p.notes.is_empty());
         assert!(!delete_track(&mut p, a));
+    }
+
+    #[test]
+    fn mute_and_solo_toggle_on_a_track() {
+        let mut p = Project::empty();
+        let id = add_track(&mut p);
+        assert!(!p.tracks[0].muted);
+        assert!(!p.tracks[0].solo);
+        assert!(toggle_track_mute(&mut p, id));
+        assert!(p.tracks[0].muted);
+        assert!(toggle_track_solo(&mut p, id));
+        assert!(p.tracks[0].solo);
+        assert!(!toggle_track_mute(&mut p, TrackId(99)));
+        assert!(!toggle_track_solo(&mut p, TrackId(99)));
     }
 }
