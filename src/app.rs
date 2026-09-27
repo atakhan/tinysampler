@@ -1,11 +1,11 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use egui::Key;
+use egui::{Pos2, Key};
 
 use crate::audio;
 use crate::browser::{self, BrowserAction, LoadBrowser};
@@ -36,12 +36,26 @@ pub(crate) struct PendingAudio {
     audition_ticket: u64,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) enum SeqDrag {
-    Move { id: SeqId, grab_offset_secs: f32 },
-    Copy { source: SeqId, grab_offset_secs: f32 },
+    Move {
+        anchor: SeqId,
+        grab_offset_secs: f32,
+        origins: Vec<(SeqId, f32)>,
+    },
+    Copy {
+        anchor: SeqId,
+        grab_offset_secs: f32,
+        origins: Vec<(SeqId, f32)>,
+    },
     ResizeStart { id: SeqId },
     ResizeEnd { id: SeqId },
+    Marquee {
+        origin: Pos2,
+        current: Pos2,
+        additive: bool,
+        saved: Vec<SeqId>,
+    },
 }
 
 pub struct TinySamplerApp {
@@ -54,8 +68,8 @@ pub struct TinySamplerApp {
     pub(crate) pixels_per_second: f32,
     pub(crate) status: String,
     pub(crate) timeline_scroll_px: f32,
-    pub(crate) selected_note: Option<NoteId>,
-    pub(crate) selected_seq: Option<SeqId>,
+    pub(crate) selected_notes: HashSet<NoteId>,
+    pub(crate) selected_seqs: HashSet<SeqId>,
     pub(crate) seq_editor: Option<SeqId>,
     pub(crate) seq_view_start: f32,
     /// Horizontal zoom of the piano roll. `0` means “fit the sequence on the next frame”.
@@ -134,8 +148,8 @@ impl TinySamplerApp {
             pixels_per_second: 120.0,
             status,
             timeline_scroll_px: 0.0,
-            selected_note: None,
-            selected_seq: None,
+            selected_notes: HashSet::new(),
+            selected_seqs: HashSet::new(),
             seq_editor: None,
             seq_view_start: 0.0,
             seq_pps: 0.0,
@@ -486,17 +500,52 @@ impl TinySamplerApp {
         self.start_next_load_if_idle();
     }
 
-    fn delete_selected_note(&mut self) {
-        let Some(id) = self.selected_note else {
+    fn delete_selected_notes(&mut self) {
+        if self.selected_notes.is_empty() {
             return;
-        };
+        }
+        let ids: Vec<NoteId> = self.selected_notes.iter().copied().collect();
         let mut p = (*self.current_project()).clone();
-        if project_actions::delete_pad_note(&mut p, id) {
-            self.selected_note = None;
+        let mut changed = false;
+        for id in ids {
+            changed |= project_actions::delete_pad_note(&mut p, id);
+        }
+        if changed {
+            self.selected_notes.clear();
             self.seq_note_drag = None;
             self.publish(p);
         }
     }
+
+    pub(crate) fn select_only_seq(&mut self, id: SeqId) {
+        self.selected_seqs.clear();
+        self.selected_seqs.insert(id);
+    }
+
+    pub(crate) fn clear_seq_selection(&mut self) {
+        self.selected_seqs.clear();
+    }
+
+    pub(crate) fn toggle_seq_selection(&mut self, id: SeqId) {
+        if !self.selected_seqs.remove(&id) {
+            self.selected_seqs.insert(id);
+        }
+    }
+
+    fn select_only_note(&mut self, id: NoteId) {
+        self.selected_notes.clear();
+        self.selected_notes.insert(id);
+    }
+
+    pub(crate) fn seq_origins(project: &Project, ids: &HashSet<SeqId>) -> Vec<(SeqId, f32)> {
+        project
+            .seq_clips
+            .iter()
+            .filter(|s| ids.contains(&s.id))
+            .map(|s| (s.id, s.start_time_secs))
+            .collect()
+    }
+
 
     fn handle_global_shortcuts(&mut self, ctx: &egui::Context) {
         if self.load_browser.is_some() {
@@ -553,7 +602,7 @@ impl TinySamplerApp {
             if escape {
                 self.close_seq_editor();
             } else if delete {
-                self.delete_selected_note();
+                self.delete_selected_notes();
             } else if ctrl_space {
                 self.transport_pause();
             } else if space {
@@ -698,8 +747,8 @@ impl TinySamplerApp {
 
     fn reset_studio_view(&mut self) {
         self.timeline_scroll_px = 0.0;
-        self.selected_note = None;
-        self.selected_seq = None;
+        self.selected_notes.clear();
+        self.selected_seqs.clear();
         self.seq_editor = None;
         self.seq_note_drag = None;
         self.seq_drag = None;
@@ -798,8 +847,9 @@ impl TinySamplerApp {
         if !project_actions::delete_track(&mut p, id) {
             return;
         }
-        if self.selected_seq.is_some_and(|sid| !p.seq_clips.iter().any(|s| s.id == sid)) {
-            self.selected_seq = None;
+        self.selected_seqs
+            .retain(|sid| p.seq_clips.iter().any(|s| s.id == *sid));
+        if self.selected_seqs.is_empty() {
             self.seq_drag = None;
         }
         if self.selected_marker.map(|(_, tid)| tid) == Some(id) {
@@ -842,19 +892,19 @@ impl TinySamplerApp {
         };
         drop(proj);
         self.seq_editor = Some(id);
-        self.selected_seq = Some(id);
+        self.select_only_seq(id);
         self.selected_track = Some(seq.track_id);
         self.seq_view_start = 0.0;
         self.seq_pps = 0.0;
         self.seq_note_drag = None;
-        self.selected_note = None;
+        self.selected_notes.clear();
         self.seq_drag = None;
     }
 
     fn close_seq_editor(&mut self) {
         self.seq_editor = None;
         self.seq_note_drag = None;
-        self.selected_note = None;
+        self.selected_notes.clear();
         self.piano_pad_held = None;
         if self.sampler_track.is_none() {
             self.stop_instrument_preview(false);
@@ -862,21 +912,36 @@ impl TinySamplerApp {
     }
 
     fn delete_selected_seq(&mut self) {
-        let Some(id) = self.selected_seq else {
+        if self.selected_seqs.is_empty() {
             return;
-        };
-        self.delete_seq(id);
+        }
+        let ids: Vec<SeqId> = self.selected_seqs.iter().copied().collect();
+        if ids.iter().any(|id| self.seq_editor == Some(*id)) {
+            self.close_seq_editor();
+        }
+        let mut p = (*self.current_project()).clone();
+        let mut changed = false;
+        for id in ids {
+            changed |= project_actions::delete_seq_clip(&mut p, id);
+        }
+        if changed {
+            self.selected_seqs.clear();
+            self.seq_drag = None;
+            self.publish(p);
+        }
     }
 
     pub(crate) fn delete_seq(&mut self, id: crate::model::SeqId) {
+        if self.selected_seqs.contains(&id) && self.selected_seqs.len() > 1 {
+            self.delete_selected_seq();
+            return;
+        }
         if self.seq_editor == Some(id) {
             self.close_seq_editor();
         }
         let mut p = (*self.current_project()).clone();
         if project_actions::delete_seq_clip(&mut p, id) {
-            if self.selected_seq == Some(id) {
-                self.selected_seq = None;
-            }
+            self.selected_seqs.remove(&id);
             self.seq_drag = None;
             self.publish(p);
         }
@@ -888,13 +953,22 @@ impl TinySamplerApp {
         };
         match action {
             pianoroll::PianoRollAction::Close => self.close_seq_editor(),
-            pianoroll::PianoRollAction::SelectNote { id } => self.selected_note = id,
-            pianoroll::PianoRollAction::DeleteNote { id } => {
+            pianoroll::PianoRollAction::SelectReplace { ids } => {
+                self.selected_notes = ids.into_iter().collect();
+            }
+            pianoroll::PianoRollAction::ToggleNote { id } => {
+                if !self.selected_notes.remove(&id) {
+                    self.selected_notes.insert(id);
+                }
+            }
+            pianoroll::PianoRollAction::DeleteNotes { ids } => {
                 let mut p = (*self.current_project()).clone();
-                if project_actions::delete_pad_note(&mut p, id) {
-                    if self.selected_note == Some(id) {
-                        self.selected_note = None;
-                    }
+                let mut changed = false;
+                for id in &ids {
+                    changed |= project_actions::delete_pad_note(&mut p, *id);
+                    self.selected_notes.remove(id);
+                }
+                if changed {
                     self.publish(p);
                 }
             }
@@ -902,7 +976,7 @@ impl TinySamplerApp {
                 let mut p = (*self.current_project()).clone();
                 match project_actions::place_pad_note(&mut p, seq_id, slot, time) {
                     Some(id) => {
-                        self.selected_note = Some(id);
+                        self.select_only_note(id);
                         self.status.clear();
                         self.publish(p);
                     }
@@ -912,40 +986,46 @@ impl TinySamplerApp {
                     }
                 }
             }
-            pianoroll::PianoRollAction::MoveNote { id, slot, time } => {
+            pianoroll::PianoRollAction::MoveNotes { items } => {
                 let mut p = (*self.current_project()).clone();
-                if project_actions::move_pad_note(&mut p, id, time, slot) {
-                    self.selected_note = Some(id);
+                if project_actions::move_pad_notes(&mut p, &items) {
                     self.publish(p);
                 }
             }
-            pianoroll::PianoRollAction::DuplicateNote {
-                source,
-                slot,
-                time,
+            pianoroll::PianoRollAction::DuplicateNotes {
+                items,
                 grab_offset_secs,
+                anchor,
             } => {
                 let mut p = (*self.current_project()).clone();
-                match project_actions::duplicate_pad_note(&mut p, source, time, slot) {
-                    Some(id) => {
-                        self.selected_note = Some(id);
-                        self.seq_note_drag = Some(pianoroll::NoteDrag::Move {
-                            id,
-                            grab_offset_secs,
-                        });
-                        self.status.clear();
-                        self.publish(p);
+                let mut new_sel = HashSet::new();
+                let mut new_origins = Vec::new();
+                let mut new_anchor = None;
+                for (source, time, slot) in items {
+                    if let Some(id) = project_actions::duplicate_pad_note(&mut p, source, time, slot)
+                    {
+                        new_sel.insert(id);
+                        new_origins.push((id, time, slot));
+                        if source == anchor {
+                            new_anchor = Some(id);
+                        }
                     }
-                    None => {
-                        let label = sampler::PAD_LABELS.get(slot as usize).copied().unwrap_or("?");
-                        self.status = format!("Сначала нарежьте пэд {label} в инструменте сэмплинга");
-                    }
+                }
+                if !new_sel.is_empty() {
+                    self.selected_notes = new_sel;
+                    self.seq_note_drag = Some(pianoroll::NoteDrag::Move {
+                        anchor: new_anchor.or_else(|| new_origins.first().map(|o| o.0)).unwrap(),
+                        grab_offset_secs,
+                        origins: new_origins,
+                    });
+                    self.status.clear();
+                    self.publish(p);
                 }
             }
             pianoroll::PianoRollAction::ResizeNoteStart { id, start } => {
                 let mut p = (*self.current_project()).clone();
                 let changed = project_actions::resize_pad_note_start(&mut p, id, start);
-                self.selected_note = Some(id);
+                self.select_only_note(id);
                 if changed {
                     self.publish(p);
                 }
@@ -953,7 +1033,7 @@ impl TinySamplerApp {
             pianoroll::PianoRollAction::ResizeNote { id, end } => {
                 let mut p = (*self.current_project()).clone();
                 let changed = project_actions::resize_pad_note(&mut p, id, end);
-                self.selected_note = Some(id);
+                self.select_only_note(id);
                 if changed {
                     self.publish(p);
                 }
@@ -1024,7 +1104,7 @@ impl TinySamplerApp {
             duration_secs: seq.duration_secs,
             notes: &notes,
             pad_markers: &pad_markers,
-            selected_note: self.selected_note,
+            selected_notes: &self.selected_notes,
             playhead_local,
             active_pad: self.sampler_active_pad,
             status: &status,

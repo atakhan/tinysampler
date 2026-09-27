@@ -192,6 +192,21 @@ pub fn color_piano_grid_step() -> Color32 {
     Color32::from_rgba_unmultiplied(255, 255, 255, 12)
 }
 
+/// Alternate vertical band of the rhythm grid (every 8 cells) on the even studio lane.
+pub fn color_piano_grid_band() -> Color32 {
+    Color32::from_rgb(36, 36, 44)
+}
+
+/// Same band on the odd (already lighter) studio lane.
+pub fn color_piano_grid_band_on_alt() -> Color32 {
+    Color32::from_rgb(46, 46, 56)
+}
+
+/// Vertical line on every 4th rhythm-grid cell.
+pub fn color_piano_grid_light() -> Color32 {
+    Color32::from_rgba_unmultiplied(255, 255, 255, 56)
+}
+
 pub fn color_piano_note() -> Color32 {
     Color32::from_rgb(186, 190, 236)
 }

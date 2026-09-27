@@ -855,6 +855,72 @@ pub fn add_seq_clip(project: &mut Project, track_id: TrackId, start_time_secs: f
     Some(id)
 }
 
+/// Keep relative offsets. If the group would cross t = 0, slide it so the earliest clip lands on 0.
+pub fn shifted_seq_starts(origins: &[(SeqId, f32)], anchor: SeqId, new_anchor: f32) -> Vec<(SeqId, f32)> {
+    let Some((_, old)) = origins.iter().find(|(id, _)| *id == anchor) else {
+        return vec![(anchor, new_anchor.max(0.0))];
+    };
+    let mut delta = new_anchor - *old;
+    if let Some(min_t) = origins.iter().map(|(_, t)| *t).reduce(f32::min) {
+        if min_t + delta < 0.0 {
+            delta = -min_t;
+        }
+    }
+    origins
+        .iter()
+        .map(|(id, t)| (*id, (*t + delta).max(0.0)))
+        .collect()
+}
+
+/// Same as [`shifted_seq_starts`], plus a shared slot delta that stays inside `0..=slot_max`.
+pub fn shifted_note_places(
+    origins: &[(NoteId, f32, u8)],
+    anchor: NoteId,
+    new_time: f32,
+    new_slot: u8,
+    slot_max: u8,
+) -> Vec<(NoteId, f32, u8)> {
+    let Some((_, old_t, old_s)) = origins.iter().find(|(id, _, _)| *id == anchor) else {
+        return vec![(anchor, new_time.max(0.0), new_slot.min(slot_max))];
+    };
+    let mut dt = new_time - *old_t;
+    let mut ds = new_slot as i32 - *old_s as i32;
+    if let Some(min_t) = origins.iter().map(|(_, t, _)| *t).reduce(f32::min) {
+        if min_t + dt < 0.0 {
+            dt = -min_t;
+        }
+    }
+    let min_s = origins.iter().map(|(_, _, s)| i32::from(*s)).min().unwrap_or(0);
+    let max_s = origins.iter().map(|(_, _, s)| i32::from(*s)).max().unwrap_or(0);
+    ds = ds.clamp(-min_s, i32::from(slot_max) - max_s);
+    origins
+        .iter()
+        .map(|(id, t, s)| {
+            (
+                *id,
+                (*t + dt).max(0.0),
+                (*s as i32 + ds).clamp(0, i32::from(slot_max)) as u8,
+            )
+        })
+        .collect()
+}
+
+pub fn move_seq_clips(project: &mut Project, placements: &[(SeqId, f32)]) -> bool {
+    let mut changed = false;
+    for (id, start) in placements {
+        changed |= move_seq_clip(project, *id, *start);
+    }
+    changed
+}
+
+pub fn move_pad_notes(project: &mut Project, placements: &[(NoteId, f32, u8)]) -> bool {
+    let mut changed = false;
+    for (id, start, slot) in placements {
+        changed |= move_pad_note(project, *id, *start, *slot);
+    }
+    changed
+}
+
 pub fn move_seq_clip(project: &mut Project, id: SeqId, start_time_secs: f32) -> bool {
     let start = start_time_secs.max(0.0);
     let Some(seq) = project.seq_clips.iter_mut().find(|s| s.id == id) else {
@@ -1280,5 +1346,31 @@ mod tests {
         assert!(p.tracks[0].solo);
         assert!(!toggle_track_mute(&mut p, TrackId(99)));
         assert!(!toggle_track_solo(&mut p, TrackId(99)));
+    }
+
+    #[test]
+    fn group_shift_keeps_offsets_and_stays_non_negative() {
+        let a = SeqId(1);
+        let b = SeqId(2);
+        let origins = [(a, 1.0), (b, 3.0)];
+        let moved = shifted_seq_starts(&origins, a, 2.5);
+        assert!((moved[0].1 - 2.5).abs() < 1e-4);
+        assert!((moved[1].1 - 4.5).abs() < 1e-4);
+        let clamped = shifted_seq_starts(&origins, a, -4.0);
+        assert!((clamped[0].1 - 0.0).abs() < 1e-4);
+        assert!((clamped[1].1 - 2.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn group_note_shift_clamps_slots_together() {
+        let a = NoteId(1);
+        let b = NoteId(2);
+        let origins = [(a, 0.5, 1u8), (b, 1.5, 3u8)];
+        let moved = shifted_note_places(&origins, a, 1.0, 2, 15);
+        assert_eq!(moved[0], (a, 1.0, 2));
+        assert_eq!(moved[1], (b, 2.0, 4));
+        let edge = shifted_note_places(&origins, a, 0.5, 0, 15);
+        assert_eq!(edge[0].2, 0);
+        assert_eq!(edge[1].2, 2);
     }
 }

@@ -176,6 +176,137 @@ pub fn visible_grid_step(pps: f32, bpm: f32) -> f32 {
     minor.unwrap_or(major).max(1e-4)
 }
 
+/// Visible cells between a light rhythm line, and between background bands.
+pub const RHYTHM_GRID_LIGHT_CELLS: f32 = 4.0;
+pub const RHYTHM_GRID_BAND_CELLS: f32 = 8.0;
+
+/// Cell size in seconds, plus the light-line period (always 4 cells).
+/// The cell grows with zoom-out so lines stay readable; 4- and 8-cell grouping stays fixed.
+pub fn rhythm_grid_steps(pps: f32, bpm: f32) -> (f32, f32) {
+    let beat = beat_secs(bpm).max(1e-4);
+    let bar = beat * BEATS_PER_BAR;
+    let mut cell = beat / 64.0;
+    while cell * pps < 12.0 && cell < bar * 128.0 {
+        cell *= 2.0;
+    }
+    (cell, cell * RHYTHM_GRID_LIGHT_CELLS)
+}
+
+pub fn rhythm_grid_band(cell: f32) -> f32 {
+    cell.max(1e-6) * RHYTHM_GRID_BAND_CELLS
+}
+
+/// Odd 8-cell groups get the alternate background. Groups start at t = 0.
+pub fn rhythm_grid_band_is_alt(t: f32, cell: f32) -> bool {
+    let band = rhythm_grid_band(cell);
+    if t < 0.0 || !band.is_finite() {
+        return false;
+    }
+    let i = (t / band).floor() as i64;
+    i.rem_euclid(2) == 1
+}
+
+fn rhythm_x(t: f32, view_left: f32, pps: f32, scroll: f32) -> f32 {
+    view_left + t * pps - scroll
+}
+
+pub(crate) fn near_multiple(t: f32, period: f32) -> bool {
+    if period <= 1e-6 {
+        return false;
+    }
+    let q = (t / period).round();
+    (q * period - t).abs() < (period * 1e-3).max(1e-4)
+}
+
+/// Vertical bands of the rhythm grid. `view_left` / `scroll` match studio sausage coordinates.
+pub fn paint_rhythm_bands(
+    painter: &Painter,
+    rect: Rect,
+    pps: f32,
+    bpm: f32,
+    view_left: f32,
+    scroll: f32,
+    fill: Color32,
+) {
+    if !pps.is_finite() || pps <= 0.0 {
+        return;
+    }
+    let (cell, _) = rhythm_grid_steps(pps, bpm);
+    let band = rhythm_grid_band(cell);
+    if !band.is_finite() || band <= 0.0 {
+        return;
+    }
+    let t_left = ((rect.left() - view_left) + scroll) / pps;
+    let t_right = ((rect.right() - view_left) + scroll) / pps;
+    let t0 = t_left.max(0.0);
+    let t1 = t_right;
+    let mut t = (t0 / band).floor() * band;
+    if t < 0.0 {
+        t = 0.0;
+    }
+    let mut guard = 0;
+    while t < t1 && guard < 512 {
+        if rhythm_grid_band_is_alt(t + cell * 0.5, cell) {
+            let x0 = rhythm_x(t, view_left, pps, scroll).max(rect.left());
+            let x1 = rhythm_x(t + band, view_left, pps, scroll).min(rect.right());
+            if x1 > x0 {
+                painter.rect_filled(
+                    Rect::from_min_max(Pos2::new(x0, rect.top()), Pos2::new(x1, rect.bottom())),
+                    0.0,
+                    fill,
+                );
+            }
+        }
+        t += band;
+        guard += 1;
+    }
+}
+
+/// Vertical cell lines. Every 4th cell is the light line.
+pub fn paint_rhythm_lines(
+    painter: &Painter,
+    rect: Rect,
+    pps: f32,
+    bpm: f32,
+    view_left: f32,
+    scroll: f32,
+) {
+    if !pps.is_finite() || pps <= 0.0 {
+        return;
+    }
+    let (cell, light) = rhythm_grid_steps(pps, bpm);
+    if !cell.is_finite() || cell <= 0.0 {
+        return;
+    }
+    let t_left = ((rect.left() - view_left) + scroll) / pps;
+    let t_right = ((rect.right() - view_left) + scroll) / pps;
+    let t0 = t_left.max(0.0);
+    let t1 = t_right;
+    let mut t = (t0 / cell).floor() * cell;
+    if t < 0.0 {
+        t = 0.0;
+    }
+    let mut guard = 0;
+    while t <= t1 + cell && guard < 4_000 {
+        if t >= 0.0 {
+            let x = rhythm_x(t, view_left, pps, scroll);
+            if x >= rect.left() - 1.0 && x <= rect.right() + 1.0 {
+                let stroke = if near_multiple(t, light) {
+                    Stroke::new(1.2_f32, theme::color_piano_grid_light())
+                } else {
+                    Stroke::new(1.0_f32, theme::color_piano_grid_step())
+                };
+                painter.line_segment(
+                    [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+                    stroke,
+                );
+            }
+        }
+        t += cell;
+        guard += 1;
+    }
+}
+
 fn format_tempo_label(t: f32, major_secs: f32, bpm: f32) -> String {
     let beat = beat_secs(bpm);
     let bar = beat * BEATS_PER_BAR;

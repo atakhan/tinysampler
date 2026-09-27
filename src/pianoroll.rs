@@ -4,7 +4,10 @@ use egui::{
     Align2, Color32, CursorIcon, FontId, PointerButton, Pos2, Rect, Sense, Stroke, Vec2,
 };
 
+use std::collections::HashSet;
+
 use crate::model::{NoteId, PadMarker, PadNote, Project, SeqClip, SeqId};
+use crate::project_actions;
 use crate::sampler;
 use crate::theme;
 use crate::timeline::{self, TrackLayout};
@@ -26,15 +29,29 @@ pub enum NoteHit {
     ResizeEnd,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum NoteDrag {
-    Move { id: NoteId, grab_offset_secs: f32 },
-    /// Alt was held when the body was pressed. The original stays; the first move creates a copy.
-    Copy { source: NoteId, grab_offset_secs: f32 },
+    Move {
+        anchor: NoteId,
+        grab_offset_secs: f32,
+        origins: Vec<(NoteId, f32, u8)>,
+    },
+    /// Alt was held when the body was pressed. The originals stay; the first move creates copies.
+    Copy {
+        anchor: NoteId,
+        grab_offset_secs: f32,
+        origins: Vec<(NoteId, f32, u8)>,
+    },
     /// Left edge: the note's end stays put, the start (and therefore the length) follows the pointer.
     ResizeStart { id: NoteId },
     /// Right edge: the start stays put, the end follows the pointer.
     ResizeEnd { id: NoteId },
+    Marquee {
+        origin: Pos2,
+        current: Pos2,
+        additive: bool,
+        saved: Vec<NoteId>,
+    },
 }
 
 pub struct PianoRollModel<'a> {
@@ -43,7 +60,7 @@ pub struct PianoRollModel<'a> {
     pub duration_secs: f32,
     pub notes: &'a [PadNote],
     pub pad_markers: &'a [PadMarker],
-    pub selected_note: Option<NoteId>,
+    pub selected_notes: &'a HashSet<NoteId>,
     pub playhead_local: Option<f32>,
     pub active_pad: Option<u8>,
     pub status: &'a str,
@@ -54,18 +71,18 @@ pub struct PianoRollModel<'a> {
 pub enum PianoRollAction {
     Close,
     Place { slot: u8, time: f32 },
-    MoveNote { id: NoteId, slot: u8, time: f32 },
-    /// Place a copy of `source` and keep dragging that copy.
-    DuplicateNote {
-        source: NoteId,
-        slot: u8,
-        time: f32,
+    MoveNotes { items: Vec<(NoteId, f32, u8)> },
+    /// Place copies of the group and keep dragging them.
+    DuplicateNotes {
+        items: Vec<(NoteId, f32, u8)>,
         grab_offset_secs: f32,
+        anchor: NoteId,
     },
     ResizeNoteStart { id: NoteId, start: f32 },
     ResizeNote { id: NoteId, end: f32 },
-    DeleteNote { id: NoteId },
-    SelectNote { id: Option<NoteId> },
+    DeleteNotes { ids: Vec<NoteId> },
+    SelectReplace { ids: Vec<NoteId> },
+    ToggleNote { id: NoteId },
 }
 
 pub fn seq_rect(
@@ -130,7 +147,7 @@ pub fn paint_sausages(
     view_left: f32,
     pps: f32,
     scroll: f32,
-    selected: Option<SeqId>,
+    selected: &HashSet<SeqId>,
 ) {
     for seq in &project.seq_clips {
         let Some(lane) = project.track_index(seq.track_id) else {
@@ -142,7 +159,7 @@ pub fn paint_sausages(
             continue;
         }
         let clip_p = painter.with_clip_rect(clips);
-        let sel = selected == Some(seq.id);
+        let sel = selected.contains(&seq.id);
         let fill = if sel {
             theme::color_piano_note_selected()
         } else {
@@ -358,6 +375,9 @@ pub fn show(
             settle_piano_view(pixels_per_second, view_start, roll.width(), model.duration_secs);
             let view_len = visible_seconds(roll.width(), *pixels_per_second);
             paint_editor(ui, keys, roll, &model, *view_start, view_len);
+            if let Some(NoteDrag::Marquee { origin, current, .. }) = note_drag.as_ref() {
+                paint_marquee(&ui.painter_at(roll), *origin, *current);
+            }
             if let Some(a) = handle_editor(
                 &resp,
                 keys,
@@ -372,7 +392,7 @@ pub fn show(
             handle_roll_scroll(ctx, &resp, roll, view_start, pixels_per_second);
 
             let footer_text = if model.status.is_empty() {
-                "Клик — нота, ПКМ — удалить. Q–I / A–K — слушать пэд, пока клавиша зажата. Ctrl+колёсико — зум, Alt+колёсико — скролл, Alt+перетаскивание — копия ноты."
+                "Клик — нота, ПКМ — удалить. Ctrl+клик или рамка с пустого места — выделить несколько. Alt+перетаскивание копирует всё выделенное. Q–I / A–K — пэд. Ctrl+колёсико — зум, Alt+колёсико — скролл."
             } else {
                 model.status
             };
@@ -388,8 +408,10 @@ pub fn show(
     if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         action = Some(PianoRollAction::Close);
     } else if ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
-        if let Some(id) = model.selected_note {
-            action = Some(PianoRollAction::DeleteNote { id });
+        if !model.selected_notes.is_empty() {
+            action = Some(PianoRollAction::DeleteNotes {
+                ids: model.selected_notes.iter().copied().collect(),
+            });
         }
     }
     action
@@ -466,27 +488,12 @@ fn x_at_time(t: f32, roll: Rect, view_start: f32, view_len: f32) -> f32 {
     roll.left() + (t - view_start) / view_len.max(1e-4) * roll.width()
 }
 
-/// Minor and major grid spacing, in seconds, so lines stay readable at any zoom.
 fn piano_grid_steps(pps: f32, bpm: f32) -> (f32, f32) {
-    let beat = timeline::beat_secs(bpm).max(1e-4);
-    let bar = beat * timeline::BEATS_PER_BAR;
-    let mut minor = beat / 64.0;
-    while minor * pps < 12.0 && minor < bar * 128.0 {
-        minor *= 2.0;
-    }
-    let mut major = minor.max(beat);
-    while major * pps < 56.0 && major < bar * 128.0 {
-        major *= 2.0;
-    }
-    (minor, major.max(minor))
+    timeline::rhythm_grid_steps(pps, bpm)
 }
 
-fn near_multiple(t: f32, period: f32) -> bool {
-    if period <= 1e-6 {
-        return false;
-    }
-    let q = (t / period).round();
-    (q * period - t).abs() < (period * 1e-3).max(1e-4)
+fn piano_rhythm_scroll(view_start: f32, pps: f32) -> f32 {
+    view_start * pps
 }
 
 fn shade_outside_sequence(
@@ -602,6 +609,71 @@ fn note_hit_at(rect: Rect, pos: Pos2) -> Option<NoteHit> {
     }
 }
 
+pub fn notes_in_rect(
+    notes: &[PadNote],
+    roll: Rect,
+    view_start: f32,
+    view_len: f32,
+    area: Rect,
+) -> Vec<NoteId> {
+    notes
+        .iter()
+        .filter(|n| note_rect_local(n, roll, view_start, view_len).intersects(area))
+        .map(|n| n.id)
+        .collect()
+}
+
+pub fn seqs_in_rect(
+    project: &Project,
+    layout: &TrackLayout,
+    view_left: f32,
+    pps: f32,
+    scroll: f32,
+    area: Rect,
+) -> Vec<SeqId> {
+    project
+        .seq_clips
+        .iter()
+        .filter(|seq| {
+            let Some(lane) = project.track_index(seq.track_id) else {
+                return false;
+            };
+            seq_rect(seq, lane, layout, view_left, pps, scroll).intersects(area)
+        })
+        .map(|seq| seq.id)
+        .collect()
+}
+
+pub fn paint_marquee(painter: &egui::Painter, origin: Pos2, current: Pos2) {
+    let r = Rect::from_two_pos(origin, current);
+    if r.width() < 1.0 && r.height() < 1.0 {
+        return;
+    }
+    painter.rect_filled(
+        r,
+        0.0,
+        Color32::from_rgba_unmultiplied(120, 160, 220, 28),
+    );
+    painter.rect_stroke(
+        r,
+        0.0,
+        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(190, 215, 255, 200)),
+    );
+}
+
+fn marquee_live_ids(saved: &[NoteId], hits: &[NoteId], additive: bool) -> Vec<NoteId> {
+    if !additive {
+        return hits.to_vec();
+    }
+    let mut ids = saved.to_vec();
+    for id in hits {
+        if !ids.contains(id) {
+            ids.push(*id);
+        }
+    }
+    ids
+}
+
 fn hit_editor_note(
     notes: &[PadNote],
     pos: Pos2,
@@ -634,6 +706,17 @@ fn paint_editor(
     let painter = ui.painter_at(Rect::from_min_max(keys.min, roll.max));
     painter.rect_filled(keys, 0.0, theme::color_ruler_bg());
     painter.rect_filled(roll, 0.0, theme::color_timeline_bg());
+    let pps = roll.width().max(1.0) / view_len.max(1e-6);
+    let rhythm_scroll = piano_rhythm_scroll(view_start, pps);
+    timeline::paint_rhythm_bands(
+        &painter,
+        roll,
+        pps,
+        model.tempo_bpm,
+        roll.left(),
+        rhythm_scroll,
+        theme::color_piano_grid_band(),
+    );
     let bound: Vec<bool> = (0..KEY_COUNT)
         .map(|s| model.pad_markers.iter().any(|m| m.slot == s as u8))
         .collect();
@@ -672,44 +755,21 @@ fn paint_editor(
         Stroke::new(1.0_f32, theme::color_timeline_border()),
     );
 
-    let pps = roll.width().max(1.0) / view_len.max(1e-6);
-    let (minor, major) = piano_grid_steps(pps, model.tempo_bpm);
-    let beat = timeline::beat_secs(model.tempo_bpm);
-    let bar = beat * timeline::BEATS_PER_BAR;
-    let t0 = view_start.max(0.0);
-    let t1 = view_start + view_len;
-    let mut t = (t0 / minor).floor() * minor;
-    if t < 0.0 {
-        t = 0.0;
-    }
-    let mut guard = 0;
-    while t <= t1 + minor && guard < 4_000 {
-        if t >= 0.0 {
-            let x = x_at_time(t, roll, view_start, view_len);
-            if x >= roll.left() - 1.0 && x <= roll.right() + 1.0 {
-                let stroke = if near_multiple(t, bar) || near_multiple(t, major) {
-                    Stroke::new(1.2_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 48))
-                } else if near_multiple(t, beat) {
-                    Stroke::new(1.0_f32, theme::color_piano_grid_beat())
-                } else {
-                    Stroke::new(1.0_f32, theme::color_piano_grid_step())
-                };
-                painter.line_segment(
-                    [Pos2::new(x, roll.top()), Pos2::new(x, roll.bottom())],
-                    stroke,
-                );
-            }
-        }
-        t += minor;
-        guard += 1;
-    }
+    timeline::paint_rhythm_lines(
+        &painter,
+        roll,
+        pps,
+        model.tempo_bpm,
+        roll.left(),
+        rhythm_scroll,
+    );
 
     shade_outside_sequence(&painter, roll, model.duration_secs, view_start, view_len);
 
     let clip_p = painter.with_clip_rect(roll);
     for note in model.notes {
         let r = note_rect_local(note, roll, view_start, view_len);
-        let sel = model.selected_note == Some(note.id);
+        let sel = model.selected_notes.contains(&note.id);
         clip_p.rect_filled(
             r,
             2.0,
@@ -776,11 +836,12 @@ fn handle_editor(
             i.pointer.press_origin(),
             i.pointer.latest_pos().or(i.pointer.interact_pos()),
             i.pointer.hover_pos(),
+            i.modifiers.alt,
+            i.modifiers.ctrl || i.modifiers.command,
         )
     });
-    let (pressed, down, press_origin, latest, hover) = pointer;
+    let (pressed, down, press_origin, latest, hover, alt, ctrl) = pointer;
 
-    let alt = ctx.input(|i| i.modifiers.alt);
     if resp.hovered() {
         if let Some(hover) = hover {
             if let Some((_, hit)) = hit_editor_note(model.notes, hover, roll, view_start, view_len) {
@@ -793,12 +854,13 @@ fn handle_editor(
         }
     }
     if note_drag.is_some() && down {
-        ctx.set_cursor_icon(match *note_drag {
+        ctx.set_cursor_icon(match note_drag {
             Some(NoteDrag::Move { .. }) => CursorIcon::Grabbing,
             Some(NoteDrag::Copy { .. }) => CursorIcon::Alias,
             Some(NoteDrag::ResizeStart { .. } | NoteDrag::ResizeEnd { .. }) => {
                 CursorIcon::ResizeHorizontal
             }
+            Some(NoteDrag::Marquee { .. }) => CursorIcon::Crosshair,
             None => CursorIcon::Default,
         });
     }
@@ -806,48 +868,75 @@ fn handle_editor(
     if ctx.input(|i| i.pointer.button_clicked(PointerButton::Secondary)) {
         if let Some(pos) = hover.or(latest) {
             if let Some((id, _)) = hit_editor_note(model.notes, pos, roll, view_start, view_len) {
-                return Some(PianoRollAction::DeleteNote { id });
+                let ids = if model.selected_notes.contains(&id) {
+                    model.selected_notes.iter().copied().collect()
+                } else {
+                    vec![id]
+                };
+                return Some(PianoRollAction::DeleteNotes { ids });
             }
         }
     }
 
-    // Decide the gesture from where the button went down, not from where the cursor is
-    // after egui's drag threshold. Lengthening a note moves the pointer off the rect
-    // before a drag would otherwise be recognized, so the resize never started.
     if pressed {
         if let Some(origin) = press_origin {
             if let Some((id, hit)) = hit_editor_note(model.notes, origin, roll, view_start, view_len)
             {
+                if ctrl && !alt && matches!(hit, NoteHit::Body) {
+                    *note_drag = None;
+                    return Some(PianoRollAction::ToggleNote { id });
+                }
+                let mut origins: Vec<(NoteId, f32, u8)> = model
+                    .notes
+                    .iter()
+                    .filter(|n| model.selected_notes.contains(&n.id) || n.id == id)
+                    .map(|n| (n.id, n.start_time_secs, n.slot))
+                    .collect();
+                if !model.selected_notes.contains(&id) {
+                    origins.retain(|(nid, _, _)| *nid == id);
+                }
+                let start = origins
+                    .iter()
+                    .find(|(nid, _, _)| *nid == id)
+                    .map(|(_, t, _)| *t)
+                    .unwrap_or(0.0);
+                let grab_offset_secs =
+                    time_at_pointer(origin.x, roll, view_start, view_len) - start;
                 *note_drag = Some(match hit {
                     NoteHit::ResizeStart => NoteDrag::ResizeStart { id },
                     NoteHit::ResizeEnd => NoteDrag::ResizeEnd { id },
-                    NoteHit::Body => {
-                        let start = model
-                            .notes
-                            .iter()
-                            .find(|n| n.id == id)
-                            .map(|n| n.start_time_secs)
-                            .unwrap_or(0.0);
-                        let grab_offset_secs =
-                            time_at_pointer(origin.x, roll, view_start, view_len) - start;
-                        if alt {
-                            NoteDrag::Copy {
-                                source: id,
-                                grab_offset_secs,
-                            }
-                        } else {
-                            NoteDrag::Move {
-                                id,
-                                grab_offset_secs,
-                            }
-                        }
-                    }
+                    NoteHit::Body if alt => NoteDrag::Copy {
+                        anchor: id,
+                        grab_offset_secs,
+                        origins,
+                    },
+                    NoteHit::Body => NoteDrag::Move {
+                        anchor: id,
+                        grab_offset_secs,
+                        origins,
+                    },
                 });
+                if !model.selected_notes.contains(&id) {
+                    return Some(PianoRollAction::SelectReplace { ids: vec![id] });
+                }
+            } else if roll.contains(origin) {
+                *note_drag = Some(NoteDrag::Marquee {
+                    origin,
+                    current: origin,
+                    additive: ctrl,
+                    saved: model.selected_notes.iter().copied().collect(),
+                });
+                if !ctrl {
+                    return Some(PianoRollAction::SelectReplace { ids: Vec::new() });
+                }
+            } else if keys.contains(origin) && !ctrl {
+                *note_drag = None;
+                return Some(PianoRollAction::SelectReplace { ids: Vec::new() });
             }
         }
     }
 
-    if let Some(drag) = *note_drag {
+    if let Some(drag) = note_drag.clone() {
         if down && !pressed {
             if let Some(pos) = latest {
                 let time = time_at_pointer(pos.x, roll, view_start, view_len);
@@ -856,21 +945,40 @@ fn handle_editor(
                     model.tempo_bpm,
                 )
                 .0;
+                let slot_max = (KEY_COUNT.saturating_sub(1)) as u8;
                 return Some(match drag {
-                    NoteDrag::Move { id, grab_offset_secs } => PianoRollAction::MoveNote {
-                        id,
-                        slot: slot_at_y(roll, pos.y),
-                        time: snap_note_move(time - grab_offset_secs, step),
-                    },
+                    NoteDrag::Move {
+                        anchor,
+                        grab_offset_secs,
+                        origins,
+                    } => {
+                        let items = project_actions::shifted_note_places(
+                            &origins,
+                            anchor,
+                            snap_note_move(time - grab_offset_secs, step),
+                            slot_at_y(roll, pos.y),
+                            slot_max,
+                        );
+                        PianoRollAction::MoveNotes { items }
+                    }
                     NoteDrag::Copy {
-                        source,
+                        anchor,
                         grab_offset_secs,
-                    } => PianoRollAction::DuplicateNote {
-                        source,
-                        slot: slot_at_y(roll, pos.y),
-                        time: snap_note_move(time - grab_offset_secs, step),
-                        grab_offset_secs,
-                    },
+                        origins,
+                    } => {
+                        let items = project_actions::shifted_note_places(
+                            &origins,
+                            anchor,
+                            snap_note_move(time - grab_offset_secs, step),
+                            slot_at_y(roll, pos.y),
+                            slot_max,
+                        );
+                        PianoRollAction::DuplicateNotes {
+                            items,
+                            grab_offset_secs,
+                            anchor,
+                        }
+                    }
                     NoteDrag::ResizeStart { id } => {
                         let end = model
                             .notes
@@ -895,38 +1003,45 @@ fn handle_editor(
                             end: snap_note_end(start, time, step),
                         }
                     }
+                    NoteDrag::Marquee {
+                        origin,
+                        additive,
+                        saved,
+                        ..
+                    } => {
+                        if let Some(NoteDrag::Marquee { current, .. }) = note_drag.as_mut() {
+                            *current = pos;
+                        }
+                        let area = Rect::from_two_pos(origin, pos);
+                        let hits = notes_in_rect(model.notes, roll, view_start, view_len, area);
+                        PianoRollAction::SelectReplace {
+                            ids: marquee_live_ids(&saved, &hits, additive),
+                        }
+                    }
                 });
             }
         } else if !down {
+            let was_marquee = matches!(drag, NoteDrag::Marquee { .. });
+            let small = if let NoteDrag::Marquee { origin, current, .. } = &drag {
+                origin.distance(*current) < 4.0
+            } else {
+                false
+            };
             *note_drag = None;
+            if was_marquee && small && !ctrl {
+                if let Some(pos) = latest.or(hover) {
+                    if roll.contains(pos)
+                        && hit_editor_note(model.notes, pos, roll, view_start, view_len).is_none()
+                    {
+                        let slot = slot_at_y(roll, pos.y);
+                        let time = time_at_x(pos.x, roll, view_start, view_len).max(0.0);
+                        return Some(PianoRollAction::Place { slot, time });
+                    }
+                }
+            }
         }
     }
 
-    if pressed {
-        if let Some(id) = note_drag.as_ref().map(|drag| match drag {
-            NoteDrag::Move { id, .. }
-            | NoteDrag::Copy { source: id, .. }
-            | NoteDrag::ResizeStart { id }
-            | NoteDrag::ResizeEnd { id } => *id,
-        }) {
-            return Some(PianoRollAction::SelectNote { id: Some(id) });
-        }
-    }
-
-    if resp.clicked_by(PointerButton::Primary) {
-        let pos = latest.or(hover)?;
-        if keys.contains(pos) {
-            return Some(PianoRollAction::SelectNote { id: None });
-        }
-        if let Some((id, _)) = hit_editor_note(model.notes, pos, roll, view_start, view_len) {
-            return Some(PianoRollAction::SelectNote { id: Some(id) });
-        }
-        if roll.contains(pos) {
-            let slot = slot_at_y(roll, pos.y);
-            let time = time_at_x(pos.x, roll, view_start, view_len).max(0.0);
-            return Some(PianoRollAction::Place { slot, time });
-        }
-    }
     None
 }
 
@@ -965,8 +1080,13 @@ fn snap_note_move(time: f32, step: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        clamp_piano_start, note_hit_at, piano_grid_steps, snap_note_end, snap_note_move, snap_note_start,
-        visible_seconds, NoteHit,
+        clamp_piano_start, note_hit_at, notes_in_rect, piano_grid_steps, snap_note_end,
+        snap_note_move, snap_note_start, visible_seconds, NoteHit,
+    };
+    use crate::model::{NoteId, PadNote, SeqId};
+    use crate::timeline::{
+        near_multiple, rhythm_grid_band, rhythm_grid_band_is_alt, RHYTHM_GRID_BAND_CELLS,
+        RHYTHM_GRID_LIGHT_CELLS,
     };
     use egui::{Pos2, Rect};
 
@@ -1035,5 +1155,53 @@ mod tests {
             (moved - fine * 2.0).abs() < 1e-3,
             "move snapped to {moved}, step {fine}"
         );
+    }
+
+    #[test]
+    fn rhythm_groups_stay_four_and_eight_cells_at_any_zoom() {
+        for pps in [8.0, 30.0, 80.0, 400.0, 2_000.0] {
+            let (cell, light) = piano_grid_steps(pps, 120.0);
+            assert!(
+                (light - cell * RHYTHM_GRID_LIGHT_CELLS).abs() < 1e-6,
+                "light period {light} at pps {pps}, cell {cell}"
+            );
+            assert!(
+                (rhythm_grid_band(cell) - cell * RHYTHM_GRID_BAND_CELLS).abs() < 1e-6,
+                "band period at pps {pps}, cell {cell}"
+            );
+            assert!(near_multiple(cell * 4.0, light));
+            assert!(near_multiple(cell * 8.0, light));
+            assert!(!near_multiple(cell * 2.0, light));
+            assert!(!rhythm_grid_band_is_alt(cell * 0.5, cell));
+            assert!(rhythm_grid_band_is_alt(cell * 8.5, cell));
+            assert!(!rhythm_grid_band_is_alt(cell * 16.5, cell));
+        }
+    }
+
+    #[test]
+    fn marquee_picks_notes_that_intersect_the_box() {
+        let notes = [
+            PadNote {
+                id: NoteId(1),
+                seq_id: SeqId(1),
+                slot: 0,
+                start_time_secs: 0.0,
+                duration_secs: 1.0,
+            },
+            PadNote {
+                id: NoteId(2),
+                seq_id: SeqId(1),
+                slot: 8,
+                start_time_secs: 4.0,
+                duration_secs: 1.0,
+            },
+        ];
+        let roll = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(160.0, 160.0));
+        let box_a = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(40.0, 20.0));
+        let hits = notes_in_rect(&notes, roll, 0.0, 8.0, box_a);
+        assert_eq!(hits, vec![NoteId(1)]);
+        let box_b = Rect::from_min_max(Pos2::new(70.0, 70.0), Pos2::new(100.0, 100.0));
+        let hits_b = notes_in_rect(&notes, roll, 0.0, 8.0, box_b);
+        assert_eq!(hits_b, vec![NoteId(2)]);
     }
 }
